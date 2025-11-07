@@ -7,6 +7,14 @@ A Model Context Protocol (MCP) server that provides full manipulation capabiliti
 
 **🐳 Multi-architecture Docker images available:** `linux/amd64`, `linux/arm64`
 
+## 🎬 See It In Action
+
+![Chat Interface Example](docs/screenshot.png)
+
+_Example chat interface created entirely through natural conversation with an AI assistant using this MCP server. See [Example 7: Chat Interface](EXAMPLES.md#-example-7-chat-interface) for the complete conversation that generated this design._
+
+The screenshot above demonstrates how you can describe a design in natural language, and the AI assistant will create it in Penpot using the MCP server's capabilities - handling layout, styling, components, and interactions automatically.
+
 ## Features
 
 ### 🎨 Complete Design Manipulation

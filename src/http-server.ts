@@ -134,8 +134,16 @@ function createMcpServer(): Server {
 
 // Create single server and transport instance
 const mcpServer = createMcpServer();
+
+// By default, the MCP SDK's Streamable HTTP transport is "stateful":
+// after initialization, clients must present Mcp-Session-Id.
+// For local multi-client workflows (OpenClaw + curl + other tools), this is annoying.
+//
+// Set MCP_STATELESS=true to disable session ids entirely.
+const MCP_STATELESS = process.env.MCP_STATELESS === 'true';
+
 const transport = new StreamableHTTPServerTransport({
-  sessionIdGenerator: () => randomUUID(),
+  sessionIdGenerator: MCP_STATELESS ? undefined : () => randomUUID(),
   onsessioninitialized: async (sessionId: string) => {
     activeSessionCount++;
     console.log(`[HTTP] New session initialized: ${sessionId} (total: ${activeSessionCount})`);
@@ -193,7 +201,9 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
   // Handle health check
   if (req.url === '/health' && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', sessions: activeSessionCount }));
+    res.end(
+      JSON.stringify({ status: 'ok', sessions: activeSessionCount, stateless: MCP_STATELESS })
+    );
     return;
   }
 

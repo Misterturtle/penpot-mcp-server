@@ -581,6 +581,43 @@ async function runTests() {
     log(`  ${text}`, 'info');
   });
 
+  await runTest('Query components (pattern filter + usage)', async () => {
+    const result = await componentTools.query_components.handler({
+      fileId: testState.fileId,
+      namePattern: 'Renamed Test Component',
+      pathPattern: 'Renamed Test Component',
+    });
+    const payload = JSON.parse(result.content[1].text);
+    if (!Array.isArray(payload.components)) {
+      throw new Error('Invalid component query payload');
+    }
+    const found = payload.components.some(
+      (component: any) => component.componentId === testState.componentId
+    );
+    if (!found) {
+      throw new Error('Expected renamed component not found in query');
+    }
+    log(`  Query returned ${payload.components.length} component(s)`, 'info');
+  });
+
+  await runTest('List orphan components', async () => {
+    const result = await componentTools.list_orphan_components.handler({
+      fileId: testState.fileId,
+      namePattern: 'Renamed Test Component',
+    });
+    const payload = JSON.parse(result.content[1].text);
+    if (!Array.isArray(payload.components)) {
+      throw new Error('Invalid orphan listing payload');
+    }
+    const foundOrphan = payload.components.some(
+      (component: any) => component.componentId === testState.componentId && component.isOrphaned
+    );
+    if (!foundOrphan) {
+      throw new Error('Expected orphaned component not found');
+    }
+    log(`  Orphan query returned ${payload.components.length} candidate(s)`, 'info');
+  });
+
   await runTest('List component instances', async () => {
     const result = await componentTools.list_component_instances.handler({
       fileId: testState.fileId,

@@ -13,12 +13,36 @@ function getComponentsIndex(data: any): Record<string, any> {
   return data?.components || {};
 }
 
+function getComponentMainInstanceId(component: any): string | undefined {
+  return component?.mainInstanceId || component?.['main-instance-id'];
+}
+
+function getComponentMainInstancePage(component: any): string | undefined {
+  return component?.mainInstancePage || component?.['main-instance-page'];
+}
+
 function getShapeParentId(shape: any): string | undefined {
   return shape?.parentId || shape?.['parent-id'];
 }
 
 function getShapeFrameId(shape: any): string | undefined {
   return shape?.frameId || shape?.['frame-id'];
+}
+
+function getShapeComponentId(shape: any): string | undefined {
+  return shape?.componentId || shape?.['component-id'];
+}
+
+function getShapeComponentFile(shape: any): string | undefined {
+  return shape?.componentFile || shape?.['component-file'];
+}
+
+function isShapeMainInstance(shape: any): boolean {
+  return shape?.mainInstance === true || shape?.['main-instance'] === true;
+}
+
+function isShapeComponentRoot(shape: any): boolean {
+  return shape?.componentRoot === true || shape?.['component-root'] === true;
 }
 
 function getShapeChildrenIds(objects: Record<string, any>, shapeId: string): string[] {
@@ -147,8 +171,8 @@ async function resolveComponentRootContext(args: {
     throw new Error(`Component not found: ${args.componentId}`);
   }
 
-  const mainInstanceId = component.mainInstanceId || component['main-instance-id'];
-  const componentMainPageId = component.mainInstancePage || component['main-instance-page'];
+  const mainInstanceId = getComponentMainInstanceId(component);
+  const componentMainPageId = getComponentMainInstancePage(component);
   const resolvedPageId = args.pageId || componentMainPageId;
 
   if (!mainInstanceId) {
@@ -186,6 +210,106 @@ async function resolveComponentRootContext(args: {
     objects,
     integrity,
   };
+}
+
+interface ComponentInstanceRecord {
+  fileId: string;
+  pageId: string;
+  pageName: string | null;
+  shapeId: string;
+  shapeName: string | null;
+  shapeType: string | null;
+  componentId: string;
+  componentFile: string | null;
+  isMainInstance: boolean;
+  isComponentRoot: boolean;
+}
+
+function listComponentInstancesFromData(args: {
+  fileId: string;
+  data: any;
+  componentId: string;
+  componentFile?: string;
+  includeMainInstance?: boolean;
+  pageId?: string;
+}): ComponentInstanceRecord[] {
+  const pagesIndex = getPagesIndex(args.data);
+  const components = getComponentsIndex(args.data);
+  const component = components[args.componentId];
+  const mainInstanceId = getComponentMainInstanceId(component);
+  const mainInstancePage = getComponentMainInstancePage(component);
+  const includeMainInstance = args.includeMainInstance !== false;
+  const instances: ComponentInstanceRecord[] = [];
+
+  for (const [pageId, page] of Object.entries(pagesIndex) as [string, any][]) {
+    if (args.pageId && args.pageId !== pageId) {
+      continue;
+    }
+
+    const pageName = typeof page?.name === 'string' ? page.name : null;
+    const objects = page?.objects || {};
+
+    for (const [shapeId, shape] of Object.entries(objects) as [string, any][]) {
+      const shapeComponentId = getShapeComponentId(shape);
+      if (shapeComponentId !== args.componentId) {
+        continue;
+      }
+
+      const shapeComponentFile = getShapeComponentFile(shape);
+      if (args.componentFile) {
+        if (shapeComponentFile && shapeComponentFile !== args.componentFile) {
+          continue;
+        }
+        if (!shapeComponentFile && args.componentFile !== args.fileId) {
+          continue;
+        }
+      }
+
+      const isMainByIdentity =
+        !!mainInstanceId &&
+        !!mainInstancePage &&
+        shapeId === mainInstanceId &&
+        pageId === mainInstancePage;
+      const isMainInstance = isMainByIdentity || isShapeMainInstance(shape);
+
+      if (!includeMainInstance && isMainInstance) {
+        continue;
+      }
+
+      instances.push({
+        fileId: args.fileId,
+        pageId,
+        pageName,
+        shapeId,
+        shapeName: typeof shape?.name === 'string' ? shape.name : null,
+        shapeType: typeof shape?.type === 'string' ? shape.type : null,
+        componentId: shapeComponentId,
+        componentFile: shapeComponentFile || null,
+        isMainInstance,
+        isComponentRoot: isShapeComponentRoot(shape),
+      });
+    }
+  }
+
+  return instances;
+}
+
+function deriveRenamedComponentPath(existingPath: string | undefined, newName: string): string {
+  if (!existingPath || !existingPath.trim()) {
+    return newName;
+  }
+
+  const pathParts = existingPath
+    .split('/')
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0);
+
+  if (pathParts.length === 0) {
+    return newName;
+  }
+
+  pathParts[pathParts.length - 1] = newName;
+  return pathParts.join('/');
 }
 
 export function createComponentTools(penpotClient: PenpotClient) {
@@ -635,6 +759,225 @@ export function createComponentTools(penpotClient: PenpotClient) {
             {
               type: 'text',
               text: `Created component: ${componentName} (ID: ${componentId})`,
+            },
+          ],
+        };
+      },
+    },
+
+    rename_component: {
+      description:
+        'Rename a component (and optionally path) without recreating it; updates component metadata using mod-component',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          fileId: { type: 'string', description: 'File ID' },
+          componentId: { type: 'string', description: 'Component ID' },
+          name: { type: 'string', description: 'New component name' },
+          path: {
+            type: 'string',
+            description:
+              'Optional full component path override. If omitted, existing path prefix is preserved and terminal segment is replaced with name.',
+          },
+        },
+        required: ['fileId', 'componentId', 'name'],
+      },
+      handler: async (args: {
+        fileId: string;
+        componentId: string;
+        name: string;
+        path?: string;
+      }) => {
+        const componentName = args.name.trim();
+        if (!componentName) {
+          throw new Error('name must be a non-empty string');
+        }
+
+        const file = await penpotClient.getFile(args.fileId);
+        const data = file.data as any;
+        const components = getComponentsIndex(data);
+        const component = components[args.componentId];
+
+        if (!component) {
+          throw new Error(`Component not found: ${args.componentId}`);
+        }
+
+        const componentPath = (args.path ?? '').trim();
+        const existingPath = typeof component.path === 'string' ? component.path : undefined;
+        const nextPath = componentPath || deriveRenamedComponentPath(existingPath, componentName);
+
+        await penpotClient.applyChanges(args.fileId, [
+          {
+            type: 'mod-component',
+            id: args.componentId,
+            name: componentName,
+            path: nextPath,
+          },
+        ] as any);
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Renamed component ${args.componentId} to "${componentName}"`,
+            },
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  componentId: args.componentId,
+                  previousName: component.name || null,
+                  previousPath: component.path || null,
+                  name: componentName,
+                  path: nextPath,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      },
+    },
+
+    delete_component: {
+      description:
+        'Delete a component from a file when it has no remaining non-main instances; fails with reference context otherwise',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          fileId: { type: 'string', description: 'File ID' },
+          componentId: { type: 'string', description: 'Component ID' },
+        },
+        required: ['fileId', 'componentId'],
+      },
+      handler: async (args: { fileId: string; componentId: string }) => {
+        const file = await penpotClient.getFile(args.fileId);
+        const data = file.data as any;
+        const components = getComponentsIndex(data);
+        const component = components[args.componentId];
+
+        if (!component) {
+          throw new Error(`Component not found: ${args.componentId}`);
+        }
+
+        const allInstances = listComponentInstancesFromData({
+          fileId: args.fileId,
+          data,
+          componentId: args.componentId,
+          includeMainInstance: true,
+        });
+        const referencingInstances = allInstances.filter((instance) => !instance.isMainInstance);
+
+        if (referencingInstances.length > 0) {
+          throw new Error(
+            `Cannot delete component ${args.componentId}: ${referencingInstances.length} referencing instance(s) still exist. Use list_component_instances for full context.\n${JSON.stringify(
+              referencingInstances,
+              null,
+              2
+            )}`
+          );
+        }
+
+        await penpotClient.applyChanges(args.fileId, [
+          {
+            type: 'del-component',
+            id: args.componentId,
+          },
+        ] as any);
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Deleted component ${args.componentId}`,
+            },
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  componentId: args.componentId,
+                  name: component.name || null,
+                  path: component.path || null,
+                  deleted: true,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      },
+    },
+
+    list_component_instances: {
+      description:
+        'List component-linked shapes for a component, with file/page/shape context for lifecycle safety checks',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          fileId: { type: 'string', description: 'File ID to inspect for instances' },
+          componentId: { type: 'string', description: 'Component ID to enumerate' },
+          componentFile: {
+            type: 'string',
+            description:
+              'Optional component file filter. Useful for linked-library components with matching IDs.',
+          },
+          pageId: {
+            type: 'string',
+            description: 'Optional page filter; when provided only this page is scanned.',
+          },
+          includeMainInstance: {
+            type: 'boolean',
+            description: 'Include the component main instance root in results (default true).',
+            default: true,
+          },
+        },
+        required: ['fileId', 'componentId'],
+      },
+      handler: async (args: {
+        fileId: string;
+        componentId: string;
+        componentFile?: string;
+        pageId?: string;
+        includeMainInstance?: boolean;
+      }) => {
+        const file = await penpotClient.getFile(args.fileId);
+        const data = file.data as any;
+        const components = getComponentsIndex(data);
+        const component = components[args.componentId];
+
+        const instances = listComponentInstancesFromData({
+          fileId: args.fileId,
+          data,
+          componentId: args.componentId,
+          componentFile: args.componentFile,
+          includeMainInstance: args.includeMainInstance,
+          pageId: args.pageId,
+        });
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Found ${instances.length} instance(s) for component ${args.componentId}`,
+            },
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  fileId: args.fileId,
+                  componentId: args.componentId,
+                  componentFoundInFile: !!component,
+                  componentName: component?.name || null,
+                  componentPath: component?.path || null,
+                  mainInstanceId: getComponentMainInstanceId(component) || null,
+                  mainInstancePage: getComponentMainInstancePage(component) || null,
+                  instances,
+                },
+                null,
+                2
+              ),
             },
           ],
         };

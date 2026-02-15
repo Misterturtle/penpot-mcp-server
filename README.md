@@ -9,7 +9,7 @@ A Model Context Protocol (MCP) server that provides full manipulation capabiliti
 
 ## 🎬 See It In Action
 
-![Chat Interface Example](docs/screenshot.png)
+![Chat Interface Example](docs/delete_rename_list_components_instances/screenshot.png)
 
 _Example chat interface created entirely through natural conversation with an AI assistant using this MCP server. See [Example 7: Chat Interface](EXAMPLES.md#-example-7-chat-interface) for the complete conversation that generated this design._
 
@@ -77,12 +77,13 @@ The screenshot above demonstrates how you can describe a design in natural langu
 - `align_shapes` - Align multiple shapes (left, center, right, top, middle, bottom)
 - `distribute_shapes` - Distribute shapes evenly with equal spacing (horizontal, vertical)
 
-#### Component System (5 tools)
+#### Component System (6 tools)
 
 - `create_component` - Create reusable component from shape
-- `update_component` - Update component name/path
+- `rename_component` - Rename component and update path metadata
 - `delete_component` - Delete component from library
 - `list_components` - List all components in file
+- `list_component_instances` - Enumerate component usage by page/shape
 - `instantiate_component` - Create component instance (supports linked libraries)
 
 #### Team & Collaboration (10 tools)

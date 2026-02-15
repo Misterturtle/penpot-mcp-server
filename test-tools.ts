@@ -521,6 +521,44 @@ async function runTests() {
     log(`  Component listing executed`, 'info');
   });
 
+  await runTest('Rename component', async () => {
+    const result = await componentTools.rename_component.handler({
+      fileId: testState.fileId,
+      componentId: testState.componentId,
+      name: 'Renamed Test Component',
+    });
+    const text = result.content[0].text;
+    if (!text.includes('Renamed component')) {
+      throw new Error('Rename failed');
+    }
+    log(`  ${text}`, 'info');
+  });
+
+  await runTest('List component instances', async () => {
+    const result = await componentTools.list_component_instances.handler({
+      fileId: testState.fileId,
+      componentId: testState.componentId,
+      includeMainInstance: true,
+    });
+    const payload = JSON.parse(result.content[1].text);
+    if (!Array.isArray(payload.instances)) {
+      throw new Error('Invalid instance listing payload');
+    }
+    log(`  Found ${payload.instances.length} component-linked shape(s)`, 'info');
+  });
+
+  await runTest('Delete component', async () => {
+    const result = await componentTools.delete_component.handler({
+      fileId: testState.fileId,
+      componentId: testState.componentId,
+    });
+    const text = result.content[0].text;
+    if (!text.includes('Deleted component')) {
+      throw new Error('Delete failed');
+    }
+    log(`  ${text}`, 'info');
+  });
+
   // ============================================================================
   // 8. SEARCH FUNCTIONALITY
   // ============================================================================

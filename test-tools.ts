@@ -295,6 +295,7 @@ async function runTests() {
     const result = await pageTools.duplicate_page.handler({
       fileId: testState.fileId,
       pageId: testState.tempPageId,
+      name: 'Renamed Test Page 2 Copy (Explicit)',
     });
     const text = result.content[0].text;
     const ids = Array.from(text.matchAll(/ID:\s*([a-f0-9-]+)/gi)).map((match) => match[1]);

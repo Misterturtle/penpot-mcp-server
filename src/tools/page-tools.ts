@@ -377,8 +377,6 @@ export function createPageTools(penpotClient: PenpotClient) {
         await penpotClient.applyChanges(args.fileId, [
           {
             type: 'add-page',
-            id: duplicatedPageId,
-            name: duplicatedPageName,
             page: duplicatedPagePayload,
           },
         ] as any);

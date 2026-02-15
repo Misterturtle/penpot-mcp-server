@@ -71,6 +71,65 @@ function createGeometryFromBounds(x: number, y: number, width: number, height: n
   };
 }
 
+function cloneShapeContent(content: any) {
+  return content ? JSON.parse(JSON.stringify(content)) : null;
+}
+
+function getTextParagraphs(content: any): any[] | null {
+  const paragraphs = content?.children?.[0]?.children;
+  return Array.isArray(paragraphs) ? paragraphs : null;
+}
+
+function setTextContentOnParagraphs(paragraphs: any[], text: string) {
+  if (paragraphs.length === 0) {
+    throw new Error('Text shape has no paragraph structure to update');
+  }
+
+  const lines = `${text}`.split(/\r?\n/);
+
+  let templateNode: any = null;
+  for (const paragraph of paragraphs) {
+    if (Array.isArray(paragraph.children) && paragraph.children.length > 0) {
+      templateNode = paragraph.children[0];
+      break;
+    }
+  }
+
+  if (!templateNode) {
+    throw new Error('Text shape has no text nodes to update');
+  }
+
+  const createTextNode = () => {
+    const node = JSON.parse(JSON.stringify(templateNode));
+    node.text = '';
+    return node;
+  };
+
+  for (let paragraphIndex = 0; paragraphIndex < paragraphs.length; paragraphIndex++) {
+    const paragraph = paragraphs[paragraphIndex];
+    if (!Array.isArray(paragraph.children) || paragraph.children.length === 0) {
+      paragraph.children = [createTextNode()];
+    }
+
+    const paragraphText = paragraphIndex < lines.length ? lines[paragraphIndex] : '';
+    paragraph.children[0].text = paragraphText;
+
+    for (let nodeIndex = 1; nodeIndex < paragraph.children.length; nodeIndex++) {
+      paragraph.children[nodeIndex].text = '';
+    }
+  }
+
+  if (lines.length > paragraphs.length) {
+    const overflow = lines.slice(paragraphs.length).join('\n');
+    const lastParagraph = paragraphs[paragraphs.length - 1];
+    if (!Array.isArray(lastParagraph.children) || lastParagraph.children.length === 0) {
+      lastParagraph.children = [createTextNode()];
+    }
+    const currentText = lastParagraph.children[0].text || '';
+    lastParagraph.children[0].text = currentText ? `${currentText}\n${overflow}` : overflow;
+  }
+}
+
 function getShapeParentId(shape: any): string | undefined {
   return shape?.parentId || shape?.['parent-id'];
 }
@@ -741,7 +800,7 @@ export function createPageAdvancedTools(penpotClient: PenpotClient) {
 
     update_shape: {
       description:
-        'Update shape properties including position, size, colors, gradients, images, borders, shadows, blur, blend modes, text alignment, and visual effects',
+        'Update shape properties including position, size, colors, gradients, images, borders, shadows, blur, blend modes, text content/alignment, and visual effects',
       inputSchema: {
         type: 'object',
         properties: {
@@ -792,6 +851,7 @@ export function createPageAdvancedTools(penpotClient: PenpotClient) {
             description: 'Blend mode: "normal", "multiply", "screen", "overlay", etc.',
           },
           fontSize: { type: 'number', description: 'Font size for text shapes' },
+          text: { type: 'string', description: 'Text content for text shapes' },
           textAlign: {
             type: 'string',
             description: 'Text alignment for text shapes: "left", "center", "right", "justify"',
@@ -857,6 +917,8 @@ export function createPageAdvancedTools(penpotClient: PenpotClient) {
           changes.operations.push({ type: 'set', attr: 'name', val: args.name });
         }
 
+        let solidTextFill: any = null;
+
         // Fill properties - priority: gradient > image > solid color
         if (args.gradientType && args.gradientStops) {
           // Gradient fill
@@ -895,34 +957,30 @@ export function createPageAdvancedTools(penpotClient: PenpotClient) {
           changes.operations.push({ type: 'set', attr: 'fills', val: fills });
         } else if (args.fillColor !== undefined || args.fillOpacity !== undefined) {
           // Solid color fill
+          const existingFill = currentShape.fills?.[0] || {};
           const fills = [
             {
-              fillColor: args.fillColor,
-              fillOpacity: args.fillOpacity !== undefined ? args.fillOpacity : 1,
+              fillColor: args.fillColor !== undefined ? args.fillColor : existingFill.fillColor,
+              fillOpacity:
+                args.fillOpacity !== undefined ? args.fillOpacity : (existingFill.fillOpacity ?? 1),
             },
           ];
           changes.operations.push({ type: 'set', attr: 'fills', val: fills });
-
-          // For text shapes, also update the text node fills in content structure
-          if (currentShape.type === 'text' && currentShape.content) {
-            const updatedContent = JSON.parse(JSON.stringify(currentShape.content)); // Deep clone
-
-            // Update fills in all text nodes
-            if (updatedContent.children?.[0]?.children) {
-              updatedContent.children[0].children.forEach((paragraph: any) => {
-                if (paragraph.children) {
-                  paragraph.children.forEach((textNode: any) => {
-                    textNode.fills = fills;
-                  });
-                }
-              });
-            }
-
-            changes.operations.push({ type: 'set', attr: 'content', val: updatedContent });
-          }
+          solidTextFill = fills[0];
         }
 
         // Text properties for text shapes
+        const hasTextContentUpdate = args.text !== undefined;
+        const hasTextStyleUpdate =
+          args.fontSize !== undefined ||
+          args.textAlign !== undefined ||
+          args.fontFamily !== undefined ||
+          args.fontWeight !== undefined ||
+          args.fontStyle !== undefined ||
+          args.textDecoration !== undefined ||
+          args.letterSpacing !== undefined ||
+          args.lineHeight !== undefined;
+
         if (currentShape.type === 'text') {
           // Font size
           if (args.fontSize !== undefined) {
@@ -954,59 +1012,73 @@ export function createPageAdvancedTools(penpotClient: PenpotClient) {
             changes.operations.push({ type: 'set', attr: 'fontStyle', val: args.fontStyle });
           }
 
-          // Update content structure with text properties
-          if (
-            args.fontSize !== undefined ||
-            args.textAlign !== undefined ||
-            args.fontFamily !== undefined ||
-            args.fontWeight !== undefined ||
-            args.fontStyle !== undefined ||
-            args.textDecoration !== undefined ||
-            args.letterSpacing !== undefined ||
-            args.lineHeight !== undefined
-          ) {
-            if (currentShape.content) {
-              const updatedContent = JSON.parse(JSON.stringify(currentShape.content)); // Deep clone
+          // Update content structure (text content, text styling, and text node fills)
+          if (solidTextFill || hasTextStyleUpdate || hasTextContentUpdate) {
+            const updatedContent = cloneShapeContent(currentShape.content);
+            const paragraphs = getTextParagraphs(updatedContent);
+            if (!paragraphs) {
+              throw new Error('Text shape has no content structure to update');
+            }
 
-              if (updatedContent.children?.[0]?.children) {
-                // Update paragraph level properties (textAlign)
-                updatedContent.children[0].children.forEach((paragraph: any) => {
-                  if (args.textAlign !== undefined) {
-                    paragraph.textAlign = args.textAlign;
-                  }
+            if (hasTextContentUpdate) {
+              setTextContentOnParagraphs(paragraphs, args.text);
+            }
 
-                  // Update text node properties
-                  if (paragraph.children) {
-                    paragraph.children.forEach((textNode: any) => {
-                      if (args.fontSize !== undefined) {
-                        textNode.fontSize = `${args.fontSize}`;
-                      }
-                      if (args.fontFamily !== undefined) {
-                        textNode.fontFamily = args.fontFamily;
-                      }
-                      if (args.fontWeight !== undefined) {
-                        textNode.fontWeight = args.fontWeight;
-                      }
-                      if (args.fontStyle !== undefined) {
-                        textNode.fontStyle = args.fontStyle;
-                      }
-                      if (args.textDecoration !== undefined) {
-                        textNode.textDecoration = args.textDecoration;
-                      }
-                      if (args.letterSpacing !== undefined) {
-                        textNode.letterSpacing = `${args.letterSpacing}`;
-                      }
-                      if (args.lineHeight !== undefined) {
-                        textNode.lineHeight = args.lineHeight;
-                      }
-                    });
-                  }
-                });
+            for (const paragraph of paragraphs) {
+              if (args.textAlign !== undefined) {
+                paragraph.textAlign = args.textAlign;
               }
 
-              changes.operations.push({ type: 'set', attr: 'content', val: updatedContent });
+              if (!Array.isArray(paragraph.children)) {
+                continue;
+              }
+
+              for (const textNode of paragraph.children) {
+                if (solidTextFill) {
+                  const existingFill = textNode.fills?.[0] || {};
+                  textNode.fills = [
+                    {
+                      ...existingFill,
+                      fillColor:
+                        solidTextFill.fillColor !== undefined
+                          ? solidTextFill.fillColor
+                          : existingFill.fillColor,
+                      fillOpacity:
+                        solidTextFill.fillOpacity !== undefined
+                          ? solidTextFill.fillOpacity
+                          : existingFill.fillOpacity,
+                    },
+                  ];
+                }
+
+                if (args.fontSize !== undefined) {
+                  textNode.fontSize = `${args.fontSize}`;
+                }
+                if (args.fontFamily !== undefined) {
+                  textNode.fontFamily = args.fontFamily;
+                }
+                if (args.fontWeight !== undefined) {
+                  textNode.fontWeight = args.fontWeight;
+                }
+                if (args.fontStyle !== undefined) {
+                  textNode.fontStyle = args.fontStyle;
+                }
+                if (args.textDecoration !== undefined) {
+                  textNode.textDecoration = args.textDecoration;
+                }
+                if (args.letterSpacing !== undefined) {
+                  textNode.letterSpacing = `${args.letterSpacing}`;
+                }
+                if (args.lineHeight !== undefined) {
+                  textNode.lineHeight = args.lineHeight;
+                }
+              }
             }
+
+            changes.operations.push({ type: 'set', attr: 'content', val: updatedContent });
           }
+        } else if (hasTextContentUpdate) {
+          throw new Error('text can only be updated for text shapes');
         }
 
         // Stroke (border) properties

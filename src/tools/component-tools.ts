@@ -384,6 +384,137 @@ async function instantiateComponent(
   return response.data;
 }
 
+function compileOptionalRegex(pattern: string | undefined, field: string): RegExp | undefined {
+  if (!pattern) {
+    return undefined;
+  }
+
+  const trimmed = pattern.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  try {
+    return new RegExp(trimmed, 'i');
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown regex error';
+    throw new Error(`Invalid ${field} regex "${trimmed}": ${message}`);
+  }
+}
+
+function matchesOptionalRegex(value: string | null | undefined, regex?: RegExp): boolean {
+  if (!regex) {
+    return true;
+  }
+  return regex.test(value || '');
+}
+
+function normalizeNonNegativeInteger(
+  value: number | undefined,
+  field: string,
+  defaultValue: number
+): number {
+  const normalized = value ?? defaultValue;
+  if (!Number.isInteger(normalized) || normalized < 0) {
+    throw new Error(`${field} must be a non-negative integer`);
+  }
+  return normalized;
+}
+
+interface ComponentRegistryEntry {
+  componentId: string;
+  name: string | null;
+  path: string | null;
+  mainInstanceId: string | null;
+  mainInstancePage: string | null;
+  totalInstanceCount: number;
+  activeInstanceCount: number;
+  isOrphaned: boolean;
+  deletable: boolean;
+  activeInstancePageIds: string[];
+  activeInstancesSample: ComponentInstanceRecord[];
+  instances?: ComponentInstanceRecord[];
+}
+
+function summarizeComponentRegistry(args: {
+  fileId: string;
+  data: any;
+  namePattern?: string;
+  pathPattern?: string;
+  onlyOrphaned?: boolean;
+  maxActiveInstances?: number;
+  includeInstances?: boolean;
+  sampleLimit?: number;
+}): ComponentRegistryEntry[] {
+  const nameRegex = compileOptionalRegex(args.namePattern, 'namePattern');
+  const pathRegex = compileOptionalRegex(args.pathPattern, 'pathPattern');
+  const sampleLimit = normalizeNonNegativeInteger(args.sampleLimit, 'sampleLimit', 5);
+
+  let maxActiveInstances: number | undefined;
+  if (args.maxActiveInstances !== undefined) {
+    maxActiveInstances = normalizeNonNegativeInteger(
+      args.maxActiveInstances,
+      'maxActiveInstances',
+      0
+    );
+  }
+
+  const componentEntries: ComponentRegistryEntry[] = [];
+  const components = getComponentsIndex(args.data);
+
+  for (const [componentId, component] of Object.entries(components) as [string, any][]) {
+    const name = typeof component?.name === 'string' ? component.name : null;
+    const path = typeof component?.path === 'string' ? component.path : null;
+
+    if (!matchesOptionalRegex(name, nameRegex)) {
+      continue;
+    }
+    if (!matchesOptionalRegex(path, pathRegex)) {
+      continue;
+    }
+
+    const instances = listComponentInstancesFromData({
+      fileId: args.fileId,
+      data: args.data,
+      componentId,
+      includeMainInstance: true,
+    });
+
+    const activeInstances = instances.filter((instance) => !instance.isMainInstance);
+    const activeInstanceCount = activeInstances.length;
+
+    if (args.onlyOrphaned === true && activeInstanceCount > 0) {
+      continue;
+    }
+    if (maxActiveInstances !== undefined && activeInstanceCount > maxActiveInstances) {
+      continue;
+    }
+
+    componentEntries.push({
+      componentId,
+      name,
+      path,
+      mainInstanceId: getComponentMainInstanceId(component) || null,
+      mainInstancePage: getComponentMainInstancePage(component) || null,
+      totalInstanceCount: instances.length,
+      activeInstanceCount,
+      isOrphaned: activeInstanceCount === 0,
+      deletable: activeInstanceCount === 0,
+      activeInstancePageIds: [...new Set(activeInstances.map((instance) => instance.pageId))],
+      activeInstancesSample: activeInstances.slice(0, sampleLimit),
+      ...(args.includeInstances ? { instances } : {}),
+    });
+  }
+
+  componentEntries.sort((left, right) => {
+    const leftKey = `${left.path || ''}::${left.name || ''}::${left.componentId}`;
+    const rightKey = `${right.path || ''}::${right.name || ''}::${right.componentId}`;
+    return leftKey.localeCompare(rightKey);
+  });
+
+  return componentEntries;
+}
+
 export function createComponentTools(penpotClient: PenpotClient) {
   return {
     inspect_component_structure: {
@@ -1141,6 +1272,189 @@ export function createComponentTools(penpotClient: PenpotClient) {
                   mainInstanceId: getComponentMainInstanceId(component) || null,
                   mainInstancePage: getComponentMainInstancePage(component) || null,
                   instances,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      },
+    },
+
+    query_components: {
+      description:
+        'Filter components by name/path pattern and return usage context (orphan + low-use visibility)',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          fileId: { type: 'string', description: 'File ID' },
+          namePattern: {
+            type: 'string',
+            description: 'Optional regex pattern applied to component names (case-insensitive)',
+          },
+          pathPattern: {
+            type: 'string',
+            description: 'Optional regex pattern applied to component paths (case-insensitive)',
+          },
+          onlyOrphaned: {
+            type: 'boolean',
+            description: 'Return only orphaned components (activeInstanceCount = 0)',
+            default: false,
+          },
+          maxActiveInstances: {
+            type: 'number',
+            description:
+              'Optional threshold to include low-use candidates (activeInstanceCount <= value)',
+          },
+          includeInstances: {
+            type: 'boolean',
+            description: 'Include full instance arrays for each component (default false)',
+            default: false,
+          },
+          sampleLimit: {
+            type: 'number',
+            description: 'Max active instances to include in per-component sample arrays',
+            default: 5,
+          },
+        },
+        required: ['fileId'],
+      },
+      handler: async (args: {
+        fileId: string;
+        namePattern?: string;
+        pathPattern?: string;
+        onlyOrphaned?: boolean;
+        maxActiveInstances?: number;
+        includeInstances?: boolean;
+        sampleLimit?: number;
+      }) => {
+        const file = await penpotClient.getFile(args.fileId);
+        const data = file.data as any;
+
+        const components = summarizeComponentRegistry({
+          fileId: args.fileId,
+          data,
+          namePattern: args.namePattern,
+          pathPattern: args.pathPattern,
+          onlyOrphaned: args.onlyOrphaned,
+          maxActiveInstances: args.maxActiveInstances,
+          includeInstances: args.includeInstances,
+          sampleLimit: args.sampleLimit,
+        });
+
+        const orphanedCount = components.filter((component) => component.isOrphaned).length;
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Found ${components.length} component(s) matching registry query`,
+            },
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  fileId: args.fileId,
+                  filters: {
+                    namePattern: args.namePattern || null,
+                    pathPattern: args.pathPattern || null,
+                    onlyOrphaned: args.onlyOrphaned === true,
+                    maxActiveInstances: args.maxActiveInstances ?? null,
+                    includeInstances: args.includeInstances === true,
+                    sampleLimit: args.sampleLimit ?? 5,
+                  },
+                  orphanedCount,
+                  components,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      },
+    },
+
+    list_orphan_components: {
+      description:
+        'List orphaned or low-use components from a file registry, including cleanup-safe usage context',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          fileId: { type: 'string', description: 'File ID' },
+          namePattern: {
+            type: 'string',
+            description: 'Optional regex pattern applied to component names (case-insensitive)',
+          },
+          pathPattern: {
+            type: 'string',
+            description: 'Optional regex pattern applied to component paths (case-insensitive)',
+          },
+          maxActiveInstances: {
+            type: 'number',
+            description:
+              'Include components with activeInstanceCount <= threshold (default 0 = true orphans)',
+            default: 0,
+          },
+          includeInstances: {
+            type: 'boolean',
+            description: 'Include full instance arrays for each returned component',
+            default: false,
+          },
+          sampleLimit: {
+            type: 'number',
+            description: 'Max active instances to include in per-component sample arrays',
+            default: 5,
+          },
+        },
+        required: ['fileId'],
+      },
+      handler: async (args: {
+        fileId: string;
+        namePattern?: string;
+        pathPattern?: string;
+        maxActiveInstances?: number;
+        includeInstances?: boolean;
+        sampleLimit?: number;
+      }) => {
+        const file = await penpotClient.getFile(args.fileId);
+        const data = file.data as any;
+        const maxActiveInstances = args.maxActiveInstances ?? 0;
+
+        const components = summarizeComponentRegistry({
+          fileId: args.fileId,
+          data,
+          namePattern: args.namePattern,
+          pathPattern: args.pathPattern,
+          maxActiveInstances,
+          includeInstances: args.includeInstances,
+          sampleLimit: args.sampleLimit,
+        });
+
+        const orphanedCount = components.filter((component) => component.isOrphaned).length;
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Found ${components.length} component(s) with activeInstanceCount <= ${maxActiveInstances}`,
+            },
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  fileId: args.fileId,
+                  maxActiveInstances,
+                  filters: {
+                    namePattern: args.namePattern || null,
+                    pathPattern: args.pathPattern || null,
+                    includeInstances: args.includeInstances === true,
+                    sampleLimit: args.sampleLimit ?? 5,
+                  },
+                  orphanedCount,
+                  lowUseCandidateCount: components.length,
+                  components,
                 },
                 null,
                 2

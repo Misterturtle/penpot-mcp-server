@@ -43,7 +43,7 @@ The screenshot above demonstrates how you can describe a design in natural langu
 - `rename_file` - Rename an existing file
 - `delete_file` - Delete a file permanently
 
-#### Page Management (8 tools)
+#### Page Management (9 tools)
 
 - `list_pages` - List all pages in a file
 - `add_page` - Add a new page to a file
@@ -52,6 +52,7 @@ The screenshot above demonstrates how you can describe a design in natural langu
 - `get_shape_properties` - Get detailed properties of a specific shape (colors, text, fonts, effects, etc.)
 - `rename_page` - Rename a page
 - `delete_page` - Delete a page from a file
+- `duplicate_page` - Duplicate a page with deterministic default naming
 - `move_shapes` - Move shapes to different parent/frame or reorder
 
 #### Shape Creation (6 tools)
@@ -77,7 +78,7 @@ The screenshot above demonstrates how you can describe a design in natural langu
 - `align_shapes` - Align multiple shapes (left, center, right, top, middle, bottom)
 - `distribute_shapes` - Distribute shapes evenly with equal spacing (horizontal, vertical)
 
-#### Component System (6 tools)
+#### Component System (8 tools)
 
 - `create_component` - Create reusable component from shape
 - `rename_component` - Rename component and update path metadata
@@ -85,6 +86,8 @@ The screenshot above demonstrates how you can describe a design in natural langu
 - `list_components` - List all components in file
 - `list_component_instances` - Enumerate component usage by page/shape
 - `instantiate_component` - Create component instance (supports linked libraries)
+- `query_components` - Filter registry by name/path patterns with usage metadata
+- `list_orphan_components` - Detect orphaned and low-use components for cleanup
 
 #### Team & Collaboration (10 tools)
 

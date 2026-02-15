@@ -312,6 +312,209 @@ function deriveRenamedComponentPath(existingPath: string | undefined, newName: s
   return pathParts.join('/');
 }
 
+interface InstantiateComponentArgs {
+  fileId: string;
+  pageId: string;
+  componentId: string;
+  componentFile: string;
+  x?: number;
+  y?: number;
+  parentId?: string;
+  index?: number;
+  sessionId?: string;
+  skipValidate?: boolean;
+}
+
+interface InstantiateComponentSourceStatus {
+  isShellContainer: boolean;
+  rootType: string | null;
+}
+
+async function instantiateComponent(
+  penpotClient: PenpotClient,
+  args: InstantiateComponentArgs,
+  sourceStatusCache?: Map<string, InstantiateComponentSourceStatus>
+) {
+  const sourceCacheKey = `${args.componentFile}:${args.componentId}`;
+  let sourceStatus = sourceStatusCache?.get(sourceCacheKey);
+
+  if (!sourceStatus) {
+    const sourceCtx = await resolveComponentRootContext({
+      penpotClient,
+      fileId: args.componentFile,
+      componentId: args.componentId,
+    });
+
+    sourceStatus = {
+      isShellContainer: sourceCtx.integrity.isShellContainer,
+      rootType: typeof sourceCtx.rootShape?.type === 'string' ? sourceCtx.rootShape.type : null,
+    };
+
+    sourceStatusCache?.set(sourceCacheKey, sourceStatus);
+  }
+
+  if (sourceStatus.isShellContainer) {
+    throw new Error(
+      `Component ${args.componentId} is a shell ${sourceStatus.rootType || 'container'} with no nested children. Repair source structure before instantiating cross-file.`
+    );
+  }
+
+  const response = await penpotClient.client.post({
+    url: '/command/instantiate-component',
+    body: {
+      fileId: args.fileId,
+      pageId: args.pageId,
+      componentId: args.componentId,
+      componentFile: args.componentFile,
+      position: {
+        x: args.x ?? 0,
+        y: args.y ?? 0,
+      },
+      ...(args.parentId && { parentId: args.parentId }),
+      ...(args.index !== undefined && { index: args.index }),
+      ...(args.sessionId && { sessionId: args.sessionId }),
+      ...(args.skipValidate !== undefined && { skipValidate: args.skipValidate }),
+    } as any,
+  });
+
+  if (response.error) {
+    throw new Error(`Failed to instantiate component: ${JSON.stringify(response.error)}`);
+  }
+
+  return response.data;
+}
+
+function compileOptionalRegex(pattern: string | undefined, field: string): RegExp | undefined {
+  if (!pattern) {
+    return undefined;
+  }
+
+  const trimmed = pattern.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  try {
+    return new RegExp(trimmed, 'i');
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown regex error';
+    throw new Error(`Invalid ${field} regex "${trimmed}": ${message}`);
+  }
+}
+
+function matchesOptionalRegex(value: string | null | undefined, regex?: RegExp): boolean {
+  if (!regex) {
+    return true;
+  }
+  return regex.test(value || '');
+}
+
+function normalizeNonNegativeInteger(
+  value: number | undefined,
+  field: string,
+  defaultValue: number
+): number {
+  const normalized = value ?? defaultValue;
+  if (!Number.isInteger(normalized) || normalized < 0) {
+    throw new Error(`${field} must be a non-negative integer`);
+  }
+  return normalized;
+}
+
+interface ComponentRegistryEntry {
+  componentId: string;
+  name: string | null;
+  path: string | null;
+  mainInstanceId: string | null;
+  mainInstancePage: string | null;
+  totalInstanceCount: number;
+  activeInstanceCount: number;
+  isOrphaned: boolean;
+  deletable: boolean;
+  activeInstancePageIds: string[];
+  activeInstancesSample: ComponentInstanceRecord[];
+  instances?: ComponentInstanceRecord[];
+}
+
+function summarizeComponentRegistry(args: {
+  fileId: string;
+  data: any;
+  namePattern?: string;
+  pathPattern?: string;
+  onlyOrphaned?: boolean;
+  maxActiveInstances?: number;
+  includeInstances?: boolean;
+  sampleLimit?: number;
+}): ComponentRegistryEntry[] {
+  const nameRegex = compileOptionalRegex(args.namePattern, 'namePattern');
+  const pathRegex = compileOptionalRegex(args.pathPattern, 'pathPattern');
+  const sampleLimit = normalizeNonNegativeInteger(args.sampleLimit, 'sampleLimit', 5);
+
+  let maxActiveInstances: number | undefined;
+  if (args.maxActiveInstances !== undefined) {
+    maxActiveInstances = normalizeNonNegativeInteger(
+      args.maxActiveInstances,
+      'maxActiveInstances',
+      0
+    );
+  }
+
+  const componentEntries: ComponentRegistryEntry[] = [];
+  const components = getComponentsIndex(args.data);
+
+  for (const [componentId, component] of Object.entries(components) as [string, any][]) {
+    const name = typeof component?.name === 'string' ? component.name : null;
+    const path = typeof component?.path === 'string' ? component.path : null;
+
+    if (!matchesOptionalRegex(name, nameRegex)) {
+      continue;
+    }
+    if (!matchesOptionalRegex(path, pathRegex)) {
+      continue;
+    }
+
+    const instances = listComponentInstancesFromData({
+      fileId: args.fileId,
+      data: args.data,
+      componentId,
+      includeMainInstance: true,
+    });
+
+    const activeInstances = instances.filter((instance) => !instance.isMainInstance);
+    const activeInstanceCount = activeInstances.length;
+
+    if (args.onlyOrphaned === true && activeInstanceCount > 0) {
+      continue;
+    }
+    if (maxActiveInstances !== undefined && activeInstanceCount > maxActiveInstances) {
+      continue;
+    }
+
+    componentEntries.push({
+      componentId,
+      name,
+      path,
+      mainInstanceId: getComponentMainInstanceId(component) || null,
+      mainInstancePage: getComponentMainInstancePage(component) || null,
+      totalInstanceCount: instances.length,
+      activeInstanceCount,
+      isOrphaned: activeInstanceCount === 0,
+      deletable: activeInstanceCount === 0,
+      activeInstancePageIds: [...new Set(activeInstances.map((instance) => instance.pageId))],
+      activeInstancesSample: activeInstances.slice(0, sampleLimit),
+      ...(args.includeInstances ? { instances } : {}),
+    });
+  }
+
+  componentEntries.sort((left, right) => {
+    const leftKey = `${left.path || ''}::${left.name || ''}::${left.componentId}`;
+    const rightKey = `${right.path || ''}::${right.name || ''}::${right.componentId}`;
+    return leftKey.localeCompare(rightKey);
+  });
+
+  return componentEntries;
+}
+
 export function createComponentTools(penpotClient: PenpotClient) {
   return {
     inspect_component_structure: {
@@ -622,52 +825,8 @@ export function createComponentTools(penpotClient: PenpotClient) {
         },
         required: ['fileId', 'pageId', 'componentId', 'componentFile'],
       },
-      handler: async (args: {
-        fileId: string;
-        pageId: string;
-        componentId: string;
-        componentFile: string;
-        x?: number;
-        y?: number;
-        parentId?: string;
-        index?: number;
-        sessionId?: string;
-        skipValidate?: boolean;
-      }) => {
-        const sourceCtx = await resolveComponentRootContext({
-          penpotClient,
-          fileId: args.componentFile,
-          componentId: args.componentId,
-        });
-
-        if (sourceCtx.integrity.isShellContainer) {
-          throw new Error(
-            `Component ${args.componentId} is a shell ${sourceCtx.rootShape.type} with no nested children. Repair source structure before instantiating cross-file.`
-          );
-        }
-
-        const response = await penpotClient.client.post({
-          url: '/command/instantiate-component',
-          body: {
-            fileId: args.fileId,
-            pageId: args.pageId,
-            componentId: args.componentId,
-            componentFile: args.componentFile,
-            position: {
-              x: args.x ?? 0,
-              y: args.y ?? 0,
-            },
-            ...(args.parentId && { parentId: args.parentId }),
-            ...(args.index !== undefined && { index: args.index }),
-            ...(args.sessionId && { sessionId: args.sessionId }),
-            ...(args.skipValidate !== undefined && { skipValidate: args.skipValidate }),
-          } as any,
-        });
-
-        if (response.error) {
-          throw new Error(`Failed to instantiate component: ${JSON.stringify(response.error)}`);
-        }
-
+      handler: async (args: InstantiateComponentArgs) => {
+        const data = await instantiateComponent(penpotClient, args);
         return {
           content: [
             {
@@ -676,7 +835,146 @@ export function createComponentTools(penpotClient: PenpotClient) {
             },
             {
               type: 'text',
-              text: JSON.stringify(response.data, null, 2),
+              text: JSON.stringify(data, null, 2),
+            },
+          ],
+        };
+      },
+    },
+
+    batch_instantiate_component: {
+      description:
+        'Instantiate multiple components in one request with per-item success/failure reporting',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          items: {
+            type: 'array',
+            description: 'Array of component instantiation operations',
+            minItems: 1,
+            items: {
+              type: 'object',
+              properties: {
+                fileId: { type: 'string', description: 'Target file ID' },
+                pageId: { type: 'string', description: 'Target page ID' },
+                componentId: { type: 'string', description: 'Component ID to instantiate' },
+                componentFile: {
+                  type: 'string',
+                  description: 'File ID where the component is defined',
+                },
+                x: { type: 'number', description: 'X position', default: 0 },
+                y: { type: 'number', description: 'Y position', default: 0 },
+                parentId: {
+                  type: 'string',
+                  description: 'Optional parent shape ID where the instance should be inserted',
+                },
+                index: {
+                  type: 'number',
+                  description: 'Optional insertion index in the parent children list',
+                },
+                sessionId: {
+                  type: 'string',
+                  description: 'Optional session ID for server-side operation tracking',
+                },
+                skipValidate: {
+                  type: 'boolean',
+                  description: 'Skip server-side validation checks',
+                },
+              },
+              required: ['fileId', 'pageId', 'componentId', 'componentFile'],
+            },
+          },
+          continueOnError: {
+            type: 'boolean',
+            description: 'Continue processing after item failures (default true)',
+            default: true,
+          },
+        },
+        required: ['items'],
+      },
+      handler: async (args: { items: InstantiateComponentArgs[]; continueOnError?: boolean }) => {
+        if (!Array.isArray(args.items) || args.items.length === 0) {
+          throw new Error('items must be a non-empty array');
+        }
+
+        const continueOnError = args.continueOnError !== false;
+        const sourceStatusCache = new Map<string, InstantiateComponentSourceStatus>();
+        const results: Array<Record<string, any>> = [];
+        let successCount = 0;
+        let failureCount = 0;
+        let stopIndex = -1;
+
+        for (let index = 0; index < args.items.length; index += 1) {
+          const item = args.items[index];
+          try {
+            const data = await instantiateComponent(penpotClient, item, sourceStatusCache);
+            results.push({
+              index,
+              status: 'success',
+              fileId: item.fileId,
+              pageId: item.pageId,
+              componentId: item.componentId,
+              componentFile: item.componentFile,
+              data,
+            });
+            successCount += 1;
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            results.push({
+              index,
+              status: 'error',
+              fileId: item.fileId,
+              pageId: item.pageId,
+              componentId: item.componentId,
+              componentFile: item.componentFile,
+              error: message,
+            });
+            failureCount += 1;
+
+            if (!continueOnError) {
+              stopIndex = index;
+              break;
+            }
+          }
+        }
+
+        if (stopIndex >= 0) {
+          for (let index = stopIndex + 1; index < args.items.length; index += 1) {
+            const item = args.items[index];
+            results.push({
+              index,
+              status: 'skipped',
+              fileId: item.fileId,
+              pageId: item.pageId,
+              componentId: item.componentId,
+              componentFile: item.componentFile,
+              error: 'Skipped because continueOnError=false and a previous item failed',
+            });
+          }
+        }
+
+        const skippedCount = results.filter((result) => result.status === 'skipped').length;
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Batch instantiate completed: ${successCount} succeeded, ${failureCount} failed, ${skippedCount} skipped (${args.items.length} total)`,
+            },
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  total: args.items.length,
+                  successCount,
+                  failureCount,
+                  skippedCount,
+                  continueOnError,
+                  results,
+                },
+                null,
+                2
+              ),
             },
           ],
         };
@@ -974,6 +1272,189 @@ export function createComponentTools(penpotClient: PenpotClient) {
                   mainInstanceId: getComponentMainInstanceId(component) || null,
                   mainInstancePage: getComponentMainInstancePage(component) || null,
                   instances,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      },
+    },
+
+    query_components: {
+      description:
+        'Filter components by name/path pattern and return usage context (orphan + low-use visibility)',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          fileId: { type: 'string', description: 'File ID' },
+          namePattern: {
+            type: 'string',
+            description: 'Optional regex pattern applied to component names (case-insensitive)',
+          },
+          pathPattern: {
+            type: 'string',
+            description: 'Optional regex pattern applied to component paths (case-insensitive)',
+          },
+          onlyOrphaned: {
+            type: 'boolean',
+            description: 'Return only orphaned components (activeInstanceCount = 0)',
+            default: false,
+          },
+          maxActiveInstances: {
+            type: 'number',
+            description:
+              'Optional threshold to include low-use candidates (activeInstanceCount <= value)',
+          },
+          includeInstances: {
+            type: 'boolean',
+            description: 'Include full instance arrays for each component (default false)',
+            default: false,
+          },
+          sampleLimit: {
+            type: 'number',
+            description: 'Max active instances to include in per-component sample arrays',
+            default: 5,
+          },
+        },
+        required: ['fileId'],
+      },
+      handler: async (args: {
+        fileId: string;
+        namePattern?: string;
+        pathPattern?: string;
+        onlyOrphaned?: boolean;
+        maxActiveInstances?: number;
+        includeInstances?: boolean;
+        sampleLimit?: number;
+      }) => {
+        const file = await penpotClient.getFile(args.fileId);
+        const data = file.data as any;
+
+        const components = summarizeComponentRegistry({
+          fileId: args.fileId,
+          data,
+          namePattern: args.namePattern,
+          pathPattern: args.pathPattern,
+          onlyOrphaned: args.onlyOrphaned,
+          maxActiveInstances: args.maxActiveInstances,
+          includeInstances: args.includeInstances,
+          sampleLimit: args.sampleLimit,
+        });
+
+        const orphanedCount = components.filter((component) => component.isOrphaned).length;
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Found ${components.length} component(s) matching registry query`,
+            },
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  fileId: args.fileId,
+                  filters: {
+                    namePattern: args.namePattern || null,
+                    pathPattern: args.pathPattern || null,
+                    onlyOrphaned: args.onlyOrphaned === true,
+                    maxActiveInstances: args.maxActiveInstances ?? null,
+                    includeInstances: args.includeInstances === true,
+                    sampleLimit: args.sampleLimit ?? 5,
+                  },
+                  orphanedCount,
+                  components,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      },
+    },
+
+    list_orphan_components: {
+      description:
+        'List orphaned or low-use components from a file registry, including cleanup-safe usage context',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          fileId: { type: 'string', description: 'File ID' },
+          namePattern: {
+            type: 'string',
+            description: 'Optional regex pattern applied to component names (case-insensitive)',
+          },
+          pathPattern: {
+            type: 'string',
+            description: 'Optional regex pattern applied to component paths (case-insensitive)',
+          },
+          maxActiveInstances: {
+            type: 'number',
+            description:
+              'Include components with activeInstanceCount <= threshold (default 0 = true orphans)',
+            default: 0,
+          },
+          includeInstances: {
+            type: 'boolean',
+            description: 'Include full instance arrays for each returned component',
+            default: false,
+          },
+          sampleLimit: {
+            type: 'number',
+            description: 'Max active instances to include in per-component sample arrays',
+            default: 5,
+          },
+        },
+        required: ['fileId'],
+      },
+      handler: async (args: {
+        fileId: string;
+        namePattern?: string;
+        pathPattern?: string;
+        maxActiveInstances?: number;
+        includeInstances?: boolean;
+        sampleLimit?: number;
+      }) => {
+        const file = await penpotClient.getFile(args.fileId);
+        const data = file.data as any;
+        const maxActiveInstances = args.maxActiveInstances ?? 0;
+
+        const components = summarizeComponentRegistry({
+          fileId: args.fileId,
+          data,
+          namePattern: args.namePattern,
+          pathPattern: args.pathPattern,
+          maxActiveInstances,
+          includeInstances: args.includeInstances,
+          sampleLimit: args.sampleLimit,
+        });
+
+        const orphanedCount = components.filter((component) => component.isOrphaned).length;
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Found ${components.length} component(s) with activeInstanceCount <= ${maxActiveInstances}`,
+            },
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  fileId: args.fileId,
+                  maxActiveInstances,
+                  filters: {
+                    namePattern: args.namePattern || null,
+                    pathPattern: args.pathPattern || null,
+                    includeInstances: args.includeInstances === true,
+                    sampleLimit: args.sampleLimit ?? 5,
+                  },
+                  orphanedCount,
+                  lowUseCandidateCount: components.length,
+                  components,
                 },
                 null,
                 2

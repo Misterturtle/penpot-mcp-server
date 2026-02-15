@@ -21,6 +21,10 @@ async function getPageContext(penpotClient: PenpotClient, fileId: string, pageId
   };
 }
 
+function getComponentsIndex(data: any): Record<string, any> {
+  return data?.components || {};
+}
+
 function getRootFrameIdFromPage(page: any, fallbackPageId: string): string {
   const objects = page?.objects || {};
   for (const [id, obj] of Object.entries(objects) as any) {
@@ -77,6 +81,53 @@ function getShapeParentId(shape: any): string | undefined {
 
 function getShapeFrameId(shape: any): string | undefined {
   return shape?.frameId || shape?.['frame-id'];
+}
+
+function getShapeComponentId(shape: any): string | null {
+  return shape?.componentId || shape?.['component-id'] || null;
+}
+
+function getShapeComponentFile(shape: any): string | null {
+  return shape?.componentFile || shape?.['component-file'] || null;
+}
+
+function getShapeShapeRef(shape: any): string | null {
+  return shape?.shapeRef || shape?.['shape-ref'] || null;
+}
+
+function isShapeMainInstance(shape: any): boolean {
+  return shape?.mainInstance === true || shape?.['main-instance'] === true;
+}
+
+function isShapeComponentRoot(shape: any): boolean {
+  return shape?.componentRoot === true || shape?.['component-root'] === true;
+}
+
+async function doesShapeComponentExist(args: {
+  penpotClient: PenpotClient;
+  sourceFileId: string;
+  sourceData: any;
+  componentId: string | null;
+  componentFile: string | null;
+}): Promise<boolean | null> {
+  if (!args.componentId) {
+    return null;
+  }
+
+  const componentFileId = args.componentFile || args.sourceFileId;
+  let lookupData = args.sourceData;
+
+  if (componentFileId !== args.sourceFileId) {
+    try {
+      const componentFile = await args.penpotClient.getFile(componentFileId);
+      lookupData = componentFile.data as any;
+    } catch {
+      return null;
+    }
+  }
+
+  const components = getComponentsIndex(lookupData);
+  return Boolean(components[args.componentId]);
 }
 
 function getShapeChildrenIds(objects: Record<string, any>, shapeId: string): string[] {
@@ -968,6 +1019,34 @@ export function createPageAdvancedTools(penpotClient: PenpotClient) {
           throw new Error(`Shape not found: ${args.shapeId}`);
         }
 
+        const componentId = getShapeComponentId(shape);
+        const componentFile = getShapeComponentFile(shape);
+        const isComponentInstance = componentId !== null;
+        const hasResidualComponentMetadata =
+          !isComponentInstance &&
+          (getShapeShapeRef(shape) !== null ||
+            isShapeMainInstance(shape) ||
+            isShapeComponentRoot(shape));
+
+        let isDetached: boolean | null = false;
+        if (isComponentInstance) {
+          const componentExists = await doesShapeComponentExist({
+            penpotClient,
+            sourceFileId: args.fileId,
+            sourceData: data,
+            componentId,
+            componentFile,
+          });
+
+          if (componentExists === null) {
+            isDetached = null;
+          } else {
+            isDetached = !componentExists;
+          }
+        } else if (hasResidualComponentMetadata) {
+          isDetached = true;
+        }
+
         // Extract relevant properties based on shape type
         const properties: any = {
           id: args.shapeId,
@@ -977,6 +1056,10 @@ export function createPageAdvancedTools(penpotClient: PenpotClient) {
           y: shape.y,
           width: shape.width,
           height: shape.height,
+          isComponentInstance,
+          componentId,
+          componentFile,
+          isDetached,
         };
 
         // Position and transform

@@ -5,6 +5,227 @@
 import { PenpotClient } from '../penpot-client.js';
 import { v4 as uuidv4 } from 'uuid';
 
+async function getPageContext(penpotClient: PenpotClient, fileId: string, pageId: string) {
+  const file = await penpotClient.getFile(fileId);
+  const data = file.data as any;
+  const pagesIndex = data?.pagesIndex || data?.['pages-index'] || {};
+  const page = pagesIndex[pageId];
+
+  if (!page) {
+    throw new Error(`Page not found: ${pageId}`);
+  }
+
+  return {
+    page,
+    objects: page.objects || {},
+  };
+}
+
+function getRootFrameIdFromPage(page: any, fallbackPageId: string): string {
+  const objects = page?.objects || {};
+  for (const [id, obj] of Object.entries(objects) as any) {
+    if (obj.type === 'frame' && !obj.parentId && !obj['parent-id']) {
+      return id;
+    }
+  }
+  return fallbackPageId;
+}
+
+function getShapeBounds(shape: any) {
+  const selrect = shape.selrect;
+  if (selrect) {
+    const x1 = selrect.x1 ?? selrect.x ?? 0;
+    const y1 = selrect.y1 ?? selrect.y ?? 0;
+    const x2 = selrect.x2 ?? x1 + (selrect.width ?? 0);
+    const y2 = selrect.y2 ?? y1 + (selrect.height ?? 0);
+    return { x1, y1, x2, y2 };
+  }
+
+  const x1 = shape.x ?? 0;
+  const y1 = shape.y ?? 0;
+  const x2 = x1 + (shape.width ?? 0);
+  const y2 = y1 + (shape.height ?? 0);
+  return { x1, y1, x2, y2 };
+}
+
+function createGeometryFromBounds(x: number, y: number, width: number, height: number) {
+  return {
+    selrect: {
+      x,
+      y,
+      width,
+      height,
+      x1: x,
+      y1: y,
+      x2: x + width,
+      y2: y + height,
+    },
+    points: [
+      { x, y },
+      { x: x + width, y },
+      { x: x + width, y: y + height },
+      { x, y: y + height },
+    ],
+    transform: { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 },
+    transformInverse: { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 },
+  };
+}
+
+function getShapeParentId(shape: any): string | undefined {
+  return shape?.parentId || shape?.['parent-id'];
+}
+
+function getShapeFrameId(shape: any): string | undefined {
+  return shape?.frameId || shape?.['frame-id'];
+}
+
+function getShapeChildrenIds(objects: Record<string, any>, shapeId: string): string[] {
+  const shape = objects[shapeId];
+  if (!shape) {
+    return [];
+  }
+
+  const fromShapes = Array.isArray(shape.shapes)
+    ? shape.shapes.filter((id: unknown) => typeof id === 'string')
+    : [];
+
+  const fromParentRefs = Object.entries(objects)
+    .filter(([_id, obj]: [string, any]) => getShapeParentId(obj) === shapeId)
+    .map(([id]) => id);
+
+  return [...new Set([...fromShapes, ...fromParentRefs])];
+}
+
+function normalizeRootShapeIds(objects: Record<string, any>, shapeIds: string[]): string[] {
+  const selected = new Set(shapeIds);
+  return shapeIds.filter((shapeId) => {
+    let parentId = getShapeParentId(objects[shapeId]);
+    const visitedParentIds = new Set<string>();
+    while (parentId && !visitedParentIds.has(parentId)) {
+      visitedParentIds.add(parentId);
+      if (selected.has(parentId)) {
+        return false;
+      }
+      const parentShape = objects[parentId];
+      if (!parentShape) {
+        break;
+      }
+      const nextParentId = getShapeParentId(parentShape);
+      if (!nextParentId || nextParentId === parentId) {
+        break;
+      }
+      parentId = nextParentId;
+    }
+    return true;
+  });
+}
+
+function collectSubtreeShapeIds(
+  objects: Record<string, any>,
+  rootShapeIds: string[]
+): { orderedIds: string[]; idSet: Set<string> } {
+  const orderedIds: string[] = [];
+  const idSet = new Set<string>();
+
+  const visit = (shapeId: string) => {
+    if (idSet.has(shapeId)) {
+      return;
+    }
+    if (!objects[shapeId]) {
+      return;
+    }
+    idSet.add(shapeId);
+    orderedIds.push(shapeId);
+
+    const childIds = getShapeChildrenIds(objects, shapeId);
+    for (const childId of childIds) {
+      visit(childId);
+    }
+  };
+
+  for (const rootShapeId of rootShapeIds) {
+    visit(rootShapeId);
+  }
+
+  return { orderedIds, idSet };
+}
+
+function buildReparentChanges(params: {
+  objects: Record<string, any>;
+  pageId: string;
+  shapeIds: string[];
+  targetParentId: string;
+  targetFrameId: string;
+}) {
+  const { objects, pageId, shapeIds, targetParentId, targetFrameId } = params;
+
+  const rootShapeIds = normalizeRootShapeIds(objects, shapeIds);
+  const { idSet: subtreeIdSet } = collectSubtreeShapeIds(objects, rootShapeIds);
+
+  const addChanges: any[] = [];
+  const addedIds = new Set<string>();
+  const rootShapeIdSet = new Set(rootShapeIds);
+
+  const addShape = (shapeId: string, nextParentId: string, nextFrameId: string) => {
+    if (addedIds.has(shapeId)) {
+      return;
+    }
+    const shape = objects[shapeId];
+    if (!shape) {
+      return;
+    }
+
+    const childIds = getShapeChildrenIds(objects, shapeId).filter((childId) =>
+      subtreeIdSet.has(childId)
+    );
+
+    const clonedShape = JSON.parse(JSON.stringify(shape));
+    delete clonedShape['parent-id'];
+    delete clonedShape['frame-id'];
+    clonedShape.parentId = nextParentId;
+    clonedShape.frameId = nextFrameId;
+
+    if (
+      Array.isArray(clonedShape.shapes) ||
+      clonedShape.type === 'group' ||
+      clonedShape.type === 'frame'
+    ) {
+      clonedShape.shapes = childIds;
+    }
+
+    addChanges.push({
+      type: 'add-obj',
+      id: shapeId,
+      pageId,
+      frameId: nextFrameId,
+      parentId: nextParentId,
+      obj: clonedShape,
+    });
+    addedIds.add(shapeId);
+
+    for (const childId of childIds) {
+      const childFrameId = clonedShape.type === 'frame' ? shapeId : nextFrameId;
+      addShape(childId, shapeId, childFrameId);
+    }
+  };
+
+  for (const rootShapeId of rootShapeIds) {
+    addShape(rootShapeId, targetParentId, targetFrameId);
+  }
+
+  const deleteChanges = rootShapeIds.map((shapeId) => ({
+    type: 'del-obj',
+    id: shapeId,
+    pageId,
+  }));
+
+  return {
+    rootShapeIds,
+    subtreeIdSet,
+    changes: [...deleteChanges, ...addChanges],
+  };
+}
+
 export function createPageAdvancedTools(penpotClient: PenpotClient) {
   return {
     get_page_shapes: {
@@ -914,6 +1135,619 @@ export function createPageAdvancedTools(penpotClient: PenpotClient) {
             {
               type: 'text',
               text: JSON.stringify(properties, null, 2),
+            },
+          ],
+        };
+      },
+    },
+
+    move_shapes: {
+      description: 'Move shapes to different parent/frame or reorder',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          fileId: { type: 'string', description: 'File ID' },
+          pageId: { type: 'string', description: 'Page ID' },
+          parentId: {
+            type: 'string',
+            description: 'Target parent shape ID (frame/group) where shapes will be moved',
+          },
+          shapeIds: {
+            type: 'array',
+            description: 'Shape IDs to move',
+            items: { type: 'string' },
+          },
+          index: {
+            type: 'number',
+            description: 'Optional insertion index in target parent children list',
+          },
+          afterShape: {
+            type: 'string',
+            description: 'Optional shape ID to place moved shapes after',
+          },
+          allowAlteringCopies: {
+            type: 'boolean',
+            description: 'Allow altering copies while moving',
+          },
+          ignoreTouched: {
+            type: 'boolean',
+            description: 'Ignore touched metadata updates',
+          },
+        },
+        required: ['fileId', 'pageId', 'parentId', 'shapeIds'],
+      },
+      handler: async (args: {
+        fileId: string;
+        pageId: string;
+        parentId: string;
+        shapeIds: string[];
+        index?: number;
+        afterShape?: string;
+        allowAlteringCopies?: boolean;
+        ignoreTouched?: boolean;
+      }) => {
+        const uniqueShapeIds = [...new Set(args.shapeIds || [])];
+        if (uniqueShapeIds.length === 0) {
+          throw new Error('shapeIds must contain at least one shape ID');
+        }
+
+        const { page, objects } = await getPageContext(penpotClient, args.fileId, args.pageId);
+        let targetParentId = args.parentId;
+        if (targetParentId === args.pageId) {
+          targetParentId = getRootFrameIdFromPage(page, args.pageId);
+        }
+
+        if (!objects[targetParentId]) {
+          throw new Error(`Parent shape not found: ${targetParentId}`);
+        }
+
+        const missingShapeIds = uniqueShapeIds.filter((id) => !objects[id]);
+        if (missingShapeIds.length > 0) {
+          throw new Error(`Shape(s) not found: ${missingShapeIds.join(', ')}`);
+        }
+
+        if (uniqueShapeIds.includes(targetParentId)) {
+          throw new Error('parentId cannot be one of the shapeIds being moved');
+        }
+
+        const targetParent = objects[targetParentId];
+        const targetFrameId =
+          targetParent?.type === 'frame'
+            ? targetParentId
+            : getShapeFrameId(targetParent) || getRootFrameIdFromPage(page, args.pageId);
+
+        const plan = buildReparentChanges({
+          objects,
+          pageId: args.pageId,
+          shapeIds: uniqueShapeIds,
+          targetParentId,
+          targetFrameId,
+        });
+
+        if (plan.rootShapeIds.length === 0) {
+          throw new Error('No movable root shapes resolved from shapeIds');
+        }
+        if (plan.subtreeIdSet.has(targetParentId)) {
+          throw new Error('parentId cannot be inside the moved shape subtree');
+        }
+
+        const deleteRootChanges = plan.changes.slice(0, plan.rootShapeIds.length);
+        const addMovedSubtreeChanges = plan.changes.slice(plan.rootShapeIds.length);
+
+        if (deleteRootChanges.length > 0) {
+          await penpotClient.applyChanges(args.fileId, deleteRootChanges as any);
+        }
+        if (addMovedSubtreeChanges.length > 0) {
+          await penpotClient.applyChanges(args.fileId, addMovedSubtreeChanges as any);
+        }
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Moved ${plan.rootShapeIds.length} root shape(s) (${plan.subtreeIdSet.size} shape(s) including descendants) to parent ${targetParentId}`,
+            },
+            ...(args.index !== undefined || args.afterShape !== undefined
+              ? [
+                  {
+                    type: 'text',
+                    text: 'Note: explicit index/afterShape ordering is best-effort in current move implementation.',
+                  },
+                ]
+              : []),
+          ],
+        };
+      },
+    },
+
+    group_shapes: {
+      description: 'Group multiple shapes under a new group shape',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          fileId: { type: 'string', description: 'File ID' },
+          pageId: { type: 'string', description: 'Page ID' },
+          shapeIds: {
+            type: 'array',
+            description: 'Shape IDs to group (at least 2)',
+            items: { type: 'string' },
+          },
+          name: { type: 'string', description: 'Group name' },
+          parentId: {
+            type: 'string',
+            description: 'Optional explicit parent shape ID for the new group',
+          },
+          index: {
+            type: 'number',
+            description: 'Optional insertion index for the new group in parent children',
+          },
+        },
+        required: ['fileId', 'pageId', 'shapeIds'],
+      },
+      handler: async (args: {
+        fileId: string;
+        pageId: string;
+        shapeIds: string[];
+        name?: string;
+        parentId?: string;
+        index?: number;
+      }) => {
+        const uniqueShapeIds = [...new Set(args.shapeIds || [])];
+        if (uniqueShapeIds.length < 2) {
+          throw new Error('shapeIds must contain at least 2 shape IDs to create a group');
+        }
+
+        const { page, objects } = await getPageContext(penpotClient, args.fileId, args.pageId);
+        const missingShapeIds = uniqueShapeIds.filter((id) => !objects[id]);
+        if (missingShapeIds.length > 0) {
+          throw new Error(`Shape(s) not found: ${missingShapeIds.join(', ')}`);
+        }
+
+        const selectedShapes = uniqueShapeIds.map((id) => objects[id]);
+        const selectedFrameIds = [
+          ...new Set(
+            selectedShapes.map((shape: any) => shape.frameId || shape['frame-id']).filter(Boolean)
+          ),
+        ];
+
+        if (selectedFrameIds.length > 1) {
+          throw new Error('All shapes must belong to the same frame to be grouped');
+        }
+
+        let targetParentId = args.parentId;
+        if (!targetParentId) {
+          const parentIds = [
+            ...new Set(
+              selectedShapes
+                .map((shape: any) => shape.parentId || shape['parent-id'])
+                .filter(Boolean)
+            ),
+          ];
+          targetParentId =
+            parentIds.length === 1
+              ? (parentIds[0] as string)
+              : getRootFrameIdFromPage(page, args.pageId);
+        }
+
+        if (targetParentId === args.pageId) {
+          targetParentId = getRootFrameIdFromPage(page, args.pageId);
+        }
+
+        if (!objects[targetParentId]) {
+          throw new Error(`Parent shape not found: ${targetParentId}`);
+        }
+
+        if (uniqueShapeIds.includes(targetParentId)) {
+          throw new Error('parentId cannot be one of the shapeIds being grouped');
+        }
+
+        const parentShape = objects[targetParentId];
+        const targetFrameId =
+          selectedFrameIds[0] ||
+          parentShape?.frameId ||
+          parentShape?.['frame-id'] ||
+          (parentShape?.type === 'frame' ? targetParentId : undefined) ||
+          getRootFrameIdFromPage(page, args.pageId);
+
+        let minX = Number.POSITIVE_INFINITY;
+        let minY = Number.POSITIVE_INFINITY;
+        let maxX = Number.NEGATIVE_INFINITY;
+        let maxY = Number.NEGATIVE_INFINITY;
+
+        for (const shape of selectedShapes) {
+          const { x1, y1, x2, y2 } = getShapeBounds(shape);
+          minX = Math.min(minX, x1);
+          minY = Math.min(minY, y1);
+          maxX = Math.max(maxX, x2);
+          maxY = Math.max(maxY, y2);
+        }
+
+        if (
+          !Number.isFinite(minX) ||
+          !Number.isFinite(minY) ||
+          !Number.isFinite(maxX) ||
+          !Number.isFinite(maxY)
+        ) {
+          throw new Error('Failed to compute shape bounds for grouping');
+        }
+
+        const width = Math.max(0, maxX - minX);
+        const height = Math.max(0, maxY - minY);
+        const groupId = uuidv4();
+        const geometry = createGeometryFromBounds(minX, minY, width, height);
+
+        const movePlan = buildReparentChanges({
+          objects,
+          pageId: args.pageId,
+          shapeIds: uniqueShapeIds,
+          targetParentId: groupId,
+          targetFrameId,
+        });
+
+        if (movePlan.rootShapeIds.length === 0) {
+          throw new Error('No groupable root shapes resolved from shapeIds');
+        }
+        if (movePlan.subtreeIdSet.has(targetParentId)) {
+          throw new Error('parentId cannot be inside the grouped shape subtree');
+        }
+
+        const deleteRootChanges = movePlan.changes.slice(0, movePlan.rootShapeIds.length);
+        const addMovedSubtreeChanges = movePlan.changes.slice(movePlan.rootShapeIds.length);
+
+        if (deleteRootChanges.length > 0) {
+          await penpotClient.applyChanges(args.fileId, deleteRootChanges as any);
+        }
+
+        await penpotClient.applyChanges(args.fileId, [
+          {
+            type: 'add-obj',
+            id: groupId,
+            pageId: args.pageId,
+            frameId: targetFrameId,
+            parentId: targetParentId,
+            ...(args.index !== undefined && { index: args.index }),
+            obj: {
+              id: groupId,
+              type: 'group',
+              name: args.name || 'Group',
+              x: minX,
+              y: minY,
+              width,
+              height,
+              parentId: targetParentId,
+              frameId: targetFrameId,
+              shapes: movePlan.rootShapeIds,
+              ...geometry,
+            },
+          },
+        ] as any);
+
+        if (addMovedSubtreeChanges.length > 0) {
+          await penpotClient.applyChanges(args.fileId, addMovedSubtreeChanges as any);
+        }
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Grouped ${movePlan.rootShapeIds.length} root shape(s) (${movePlan.subtreeIdSet.size} shape(s) including descendants) into ${args.name || 'Group'} (ID: ${groupId})`,
+            },
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  groupId,
+                  parentId: targetParentId,
+                  frameId: targetFrameId,
+                  shapeIds: movePlan.rootShapeIds,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      },
+    },
+
+    get_shape_token_bindings: {
+      description:
+        'Inspect token bindings for a shape, including applied tokens and style token references (fill/stroke/typography)',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          fileId: { type: 'string', description: 'File ID' },
+          pageId: { type: 'string', description: 'Page ID' },
+          shapeId: { type: 'string', description: 'Shape ID' },
+        },
+        required: ['fileId', 'pageId', 'shapeId'],
+      },
+      handler: async (args: { fileId: string; pageId: string; shapeId: string }) => {
+        const { objects } = await getPageContext(penpotClient, args.fileId, args.pageId);
+        const shape = objects[args.shapeId];
+
+        if (!shape) {
+          throw new Error(`Shape not found: ${args.shapeId}`);
+        }
+
+        const bindings: any = {
+          shapeId: args.shapeId,
+          name: shape.name,
+          type: shape.type,
+          appliedTokens: shape.appliedTokens || shape['applied-tokens'] || null,
+          fills: Array.isArray(shape.fills)
+            ? shape.fills.map((fill: any, index: number) => ({
+                index,
+                fillColorRefId: fill.fillColorRefId || fill['fill-color-ref-id'] || null,
+                fillColorRefFile: fill.fillColorRefFile || fill['fill-color-ref-file'] || null,
+              }))
+            : [],
+          strokes: Array.isArray(shape.strokes)
+            ? shape.strokes.map((stroke: any, index: number) => ({
+                index,
+                strokeColorRefId: stroke.strokeColorRefId || stroke['stroke-color-ref-id'] || null,
+                strokeColorRefFile:
+                  stroke.strokeColorRefFile || stroke['stroke-color-ref-file'] || null,
+              }))
+            : [],
+        };
+
+        if (shape.type === 'text' && shape.content?.children?.[0]?.children) {
+          const paragraphs = shape.content.children[0].children;
+          bindings.typographyRefs = paragraphs.map((paragraph: any, index: number) => ({
+            index,
+            typographyRefId: paragraph.typographyRefId || paragraph['typography-ref-id'] || null,
+            typographyRefFile:
+              paragraph.typographyRefFile || paragraph['typography-ref-file'] || null,
+          }));
+        } else {
+          bindings.typographyRefs = [];
+        }
+
+        const hasBindings =
+          Boolean(bindings.appliedTokens && Object.keys(bindings.appliedTokens).length > 0) ||
+          bindings.fills.some((fill: any) => fill.fillColorRefId || fill.fillColorRefFile) ||
+          bindings.strokes.some(
+            (stroke: any) => stroke.strokeColorRefId || stroke.strokeColorRefFile
+          ) ||
+          bindings.typographyRefs.some((ref: any) => ref.typographyRefId || ref.typographyRefFile);
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: hasBindings
+                ? `Found token bindings for shape ${args.shapeId}`
+                : `No token bindings found for shape ${args.shapeId}`,
+            },
+            {
+              type: 'text',
+              text: JSON.stringify(bindings, null, 2),
+            },
+          ],
+        };
+      },
+    },
+
+    set_shape_token_bindings: {
+      description:
+        'Set token bindings for a shape (applied tokens and style token references for fill/stroke/typography)',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          fileId: { type: 'string', description: 'File ID' },
+          pageId: { type: 'string', description: 'Page ID' },
+          shapeId: { type: 'string', description: 'Shape ID' },
+          appliedTokens: {
+            type: 'object',
+            description:
+              'Token refs map to assign to shape.appliedTokens (e.g., {"r1":"radius.sm","fill":"color.primary"})',
+            additionalProperties: { type: 'string' },
+          },
+          mergeAppliedTokens: {
+            type: 'boolean',
+            description: 'Merge with existing appliedTokens (default true)',
+            default: true,
+          },
+          fillIndex: { type: 'number', description: 'Fill index to update (default 0)' },
+          fillColorRefId: { type: 'string', description: 'Fill token/color style reference ID' },
+          fillColorRefFile: { type: 'string', description: 'File ID for fillColorRefId' },
+          clearFillColorRef: { type: 'boolean', description: 'Clear fill color reference fields' },
+          strokeIndex: { type: 'number', description: 'Stroke index to update (default 0)' },
+          strokeColorRefId: {
+            type: 'string',
+            description: 'Stroke token/color style reference ID',
+          },
+          strokeColorRefFile: { type: 'string', description: 'File ID for strokeColorRefId' },
+          clearStrokeColorRef: {
+            type: 'boolean',
+            description: 'Clear stroke color reference fields',
+          },
+          paragraphIndex: {
+            type: 'number',
+            description: 'Text paragraph index for typography refs (default: all paragraphs)',
+          },
+          typographyRefId: {
+            type: 'string',
+            description: 'Typography reference ID for text paragraphs',
+          },
+          typographyRefFile: { type: 'string', description: 'File ID for typographyRefId' },
+          clearTypographyRef: { type: 'boolean', description: 'Clear typography reference fields' },
+        },
+        required: ['fileId', 'pageId', 'shapeId'],
+      },
+      handler: async (args: {
+        fileId: string;
+        pageId: string;
+        shapeId: string;
+        appliedTokens?: Record<string, string>;
+        mergeAppliedTokens?: boolean;
+        fillIndex?: number;
+        fillColorRefId?: string;
+        fillColorRefFile?: string;
+        clearFillColorRef?: boolean;
+        strokeIndex?: number;
+        strokeColorRefId?: string;
+        strokeColorRefFile?: string;
+        clearStrokeColorRef?: boolean;
+        paragraphIndex?: number;
+        typographyRefId?: string;
+        typographyRefFile?: string;
+        clearTypographyRef?: boolean;
+      }) => {
+        const { objects } = await getPageContext(penpotClient, args.fileId, args.pageId);
+        const shape = objects[args.shapeId];
+
+        if (!shape) {
+          throw new Error(`Shape not found: ${args.shapeId}`);
+        }
+
+        const change: any = {
+          type: 'mod-obj',
+          id: args.shapeId,
+          pageId: args.pageId,
+          operations: [],
+        };
+        const updatedParts: string[] = [];
+
+        if (args.appliedTokens !== undefined) {
+          if (
+            typeof args.appliedTokens !== 'object' ||
+            args.appliedTokens === null ||
+            Array.isArray(args.appliedTokens)
+          ) {
+            throw new Error('appliedTokens must be an object map');
+          }
+
+          const existingAppliedTokens = shape.appliedTokens || shape['applied-tokens'] || {};
+          const nextAppliedTokens =
+            args.mergeAppliedTokens === false
+              ? args.appliedTokens
+              : {
+                  ...existingAppliedTokens,
+                  ...args.appliedTokens,
+                };
+
+          change.operations.push({ type: 'set', attr: 'appliedTokens', val: nextAppliedTokens });
+          updatedParts.push('appliedTokens');
+        }
+
+        const updateFillRef =
+          args.fillColorRefId !== undefined ||
+          args.fillColorRefFile !== undefined ||
+          args.clearFillColorRef === true;
+        if (updateFillRef) {
+          const fillIndex = args.fillIndex ?? 0;
+          if (fillIndex < 0) {
+            throw new Error('fillIndex must be 0 or greater');
+          }
+
+          const fills = Array.isArray(shape.fills) ? JSON.parse(JSON.stringify(shape.fills)) : [];
+          while (fills.length <= fillIndex) {
+            fills.push({});
+          }
+
+          if (args.clearFillColorRef) {
+            delete fills[fillIndex].fillColorRefId;
+            delete fills[fillIndex].fillColorRefFile;
+          }
+          if (args.fillColorRefId !== undefined) {
+            fills[fillIndex].fillColorRefId = args.fillColorRefId;
+          }
+          if (args.fillColorRefFile !== undefined) {
+            fills[fillIndex].fillColorRefFile = args.fillColorRefFile;
+          }
+
+          change.operations.push({ type: 'set', attr: 'fills', val: fills });
+          updatedParts.push('fill refs');
+        }
+
+        const updateStrokeRef =
+          args.strokeColorRefId !== undefined ||
+          args.strokeColorRefFile !== undefined ||
+          args.clearStrokeColorRef === true;
+        if (updateStrokeRef) {
+          const strokeIndex = args.strokeIndex ?? 0;
+          if (strokeIndex < 0) {
+            throw new Error('strokeIndex must be 0 or greater');
+          }
+
+          const strokes = Array.isArray(shape.strokes)
+            ? JSON.parse(JSON.stringify(shape.strokes))
+            : [];
+          while (strokes.length <= strokeIndex) {
+            strokes.push({});
+          }
+
+          if (args.clearStrokeColorRef) {
+            delete strokes[strokeIndex].strokeColorRefId;
+            delete strokes[strokeIndex].strokeColorRefFile;
+          }
+          if (args.strokeColorRefId !== undefined) {
+            strokes[strokeIndex].strokeColorRefId = args.strokeColorRefId;
+          }
+          if (args.strokeColorRefFile !== undefined) {
+            strokes[strokeIndex].strokeColorRefFile = args.strokeColorRefFile;
+          }
+
+          change.operations.push({ type: 'set', attr: 'strokes', val: strokes });
+          updatedParts.push('stroke refs');
+        }
+
+        const updateTypographyRef =
+          args.typographyRefId !== undefined ||
+          args.typographyRefFile !== undefined ||
+          args.clearTypographyRef === true;
+        if (updateTypographyRef) {
+          if (shape.type !== 'text') {
+            throw new Error('Typography refs can only be updated for text shapes');
+          }
+
+          const content = shape.content ? JSON.parse(JSON.stringify(shape.content)) : null;
+          const paragraphs = content?.children?.[0]?.children;
+          if (!Array.isArray(paragraphs) || paragraphs.length === 0) {
+            throw new Error('Text shape has no paragraph structure to update');
+          }
+
+          const paragraphIndexes =
+            args.paragraphIndex !== undefined
+              ? [args.paragraphIndex]
+              : paragraphs.map((_p: any, index: number) => index);
+
+          for (const paragraphIndex of paragraphIndexes) {
+            if (paragraphIndex < 0 || paragraphIndex >= paragraphs.length) {
+              throw new Error(`paragraphIndex out of range: ${paragraphIndex}`);
+            }
+            const paragraph = paragraphs[paragraphIndex];
+            if (args.clearTypographyRef) {
+              delete paragraph.typographyRefId;
+              delete paragraph.typographyRefFile;
+            }
+            if (args.typographyRefId !== undefined) {
+              paragraph.typographyRefId = args.typographyRefId;
+            }
+            if (args.typographyRefFile !== undefined) {
+              paragraph.typographyRefFile = args.typographyRefFile;
+            }
+          }
+
+          change.operations.push({ type: 'set', attr: 'content', val: content });
+          updatedParts.push('typography refs');
+        }
+
+        if (change.operations.length === 0) {
+          throw new Error(
+            'No token binding updates provided. Set appliedTokens and/or fill/stroke/typography ref fields.'
+          );
+        }
+
+        await penpotClient.applyChanges(args.fileId, [change]);
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Updated token bindings for shape ${args.shapeId}: ${updatedParts.join(', ')}`,
             },
           ],
         };

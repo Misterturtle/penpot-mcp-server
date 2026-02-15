@@ -63,12 +63,14 @@ The screenshot above demonstrates how you can describe a design in natural langu
 - `create_svg` - Create SVG elements
 - `create_path` - Create custom paths (planned)
 
-#### Shape Manipulation (3 tools)
+#### Shape Manipulation (6 tools)
 
 - `update_shape` - Modify shape properties (position, size, style, etc.)
 - `delete_shape` - Remove shapes from the design
+- `group_shapes` - Group multiple shapes
+- `get_shape_token_bindings` - Inspect token bindings for a shape
+- `set_shape_token_bindings` - Bind style/token references on a shape
 - `duplicate_shapes` - Duplicate shapes (planned)
-- `group_shapes` - Group multiple shapes (planned)
 
 #### Shape Alignment & Distribution (2 tools)
 
@@ -81,7 +83,7 @@ The screenshot above demonstrates how you can describe a design in natural langu
 - `update_component` - Update component name/path
 - `delete_component` - Delete component from library
 - `list_components` - List all components in file
-- `instantiate_component` - Create component instance (planned)
+- `instantiate_component` - Create component instance (supports linked libraries)
 
 #### Team & Collaboration (10 tools)
 
@@ -287,6 +289,50 @@ Add to your Claude Desktop configuration (`~/Library/Application Support/Claude/
     }
   }
 }
+```
+
+#### With Codex (Global MCP Registration)
+
+Codex can launch this MCP server on-demand via stdio, so you do **not** need to keep a background MCP process running.
+
+1. Ensure your shell has Penpot credentials:
+
+```bash
+export PENPOT_API_URL="https://design.penpot.app"
+export PENPOT_ACCESS_TOKEN="your-access-token"
+```
+
+If you run a local Penpot stack, use:
+
+```bash
+export PENPOT_API_URL="http://localhost:9001"
+```
+
+2. Add the MCP server globally in Codex:
+
+```bash
+codex mcp add penpot-mcp \
+  --env PENPOT_API_URL="$PENPOT_API_URL" \
+  --env PENPOT_ACCESS_TOKEN="$PENPOT_ACCESS_TOKEN" \
+  -- npx -y @zcubekr/penpot-mcp-server
+```
+
+3. Verify registration:
+
+```bash
+codex mcp list
+codex mcp get penpot-mcp
+```
+
+4. Modify/update the configuration later:
+
+```bash
+codex mcp remove penpot-mcp
+
+codex mcp add penpot-mcp \
+  --env PENPOT_API_URL="$PENPOT_API_URL" \
+  --env PENPOT_ACCESS_TOKEN="$PENPOT_ACCESS_TOKEN" \
+  -- npx -y @zcubekr/penpot-mcp-server
 ```
 
 #### With Other MCP Clients

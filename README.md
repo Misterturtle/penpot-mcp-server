@@ -31,7 +31,7 @@ The screenshot above demonstrates how you can describe a design in natural langu
 - Session-based updates with revision tracking
 - Support for batch operations
 
-### 🛠️ Available Tools (76+ Tools!)
+### 🛠️ Available Tools (79+ Tools!)
 
 #### Project & File Management (8 tools)
 
@@ -43,7 +43,7 @@ The screenshot above demonstrates how you can describe a design in natural langu
 - `rename_file` - Rename an existing file
 - `delete_file` - Delete a file permanently
 
-#### Page Management (8 tools)
+#### Page Management (9 tools)
 
 - `list_pages` - List all pages in a file
 - `add_page` - Add a new page to a file
@@ -52,6 +52,7 @@ The screenshot above demonstrates how you can describe a design in natural langu
 - `get_shape_properties` - Get detailed properties of a specific shape (colors, text, fonts, effects, etc.)
 - `rename_page` - Rename a page
 - `delete_page` - Delete a page from a file
+- `duplicate_page` - Duplicate a page with deterministic default naming
 - `move_shapes` - Move shapes to different parent/frame or reorder
 
 #### Shape Creation (6 tools)
@@ -63,13 +64,15 @@ The screenshot above demonstrates how you can describe a design in natural langu
 - `create_svg` - Create SVG elements
 - `create_path` - Create custom paths (planned)
 
-#### Shape Manipulation (6 tools)
+#### Shape Manipulation (8 tools)
 
-- `update_shape` - Modify shape properties (position, size, style, etc.)
+- `update_shape` - Modify shape properties (position, size, style, text content, etc.)
 - `delete_shape` - Remove shapes from the design
+- `batch_delete_shape` - Delete many shapes with per-item results
 - `group_shapes` - Group multiple shapes
 - `get_shape_token_bindings` - Inspect token bindings for a shape
 - `set_shape_token_bindings` - Bind style/token references on a shape
+- `batch_set_shape_token_bindings` - Apply token bindings across many shapes with per-item results
 - `duplicate_shapes` - Duplicate shapes (planned)
 
 #### Shape Alignment & Distribution (2 tools)
@@ -77,7 +80,7 @@ The screenshot above demonstrates how you can describe a design in natural langu
 - `align_shapes` - Align multiple shapes (left, center, right, top, middle, bottom)
 - `distribute_shapes` - Distribute shapes evenly with equal spacing (horizontal, vertical)
 
-#### Component System (8 tools)
+#### Component System (9 tools)
 
 - `create_component` - Create reusable component from shape
 - `rename_component` - Rename component and update path metadata
@@ -85,6 +88,7 @@ The screenshot above demonstrates how you can describe a design in natural langu
 - `list_components` - List all components in file
 - `list_component_instances` - Enumerate component usage by page/shape
 - `instantiate_component` - Create component instance (supports linked libraries)
+- `batch_instantiate_component` - Instantiate many components with per-item results
 - `query_components` - Filter registry by name/path patterns with usage metadata
 - `list_orphan_components` - Detect orphaned and low-use components for cleanup
 

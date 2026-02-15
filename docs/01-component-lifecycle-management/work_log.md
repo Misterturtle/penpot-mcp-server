@@ -9,3 +9,11 @@
 - 2026-02-15: Extended `test-tools.ts` component section to exercise rename/list-instances/delete flows in integration sequence.
 - 2026-02-15: Updated README component tool inventory; validated TypeScript compile integrity via `npm run build` (pass).
 - 2026-02-15: API issue document intentionally not created (`docs/api_request.md`) because required backend primitives already exist and were consumed directly at MCP layer.
+- 2026-02-15: Parsed follow-up validation report; confirmed two defects: cross-file delete blind spot and path normalization side effects during rename.
+- 2026-02-15: Re-validated capability boundary; fix remains MCP-layer using existing `get-library-file-references` + `mod-component`/`del-component`.
+- 2026-02-15: Authored follow-up rationale and implementation plan under dedicated subfolder to preserve original docs.
+- 2026-02-15: Patched `delete_component` to enforce cross-file safety by resolving library consumer files, scanning component-linked instances in each consumer, and refusing delete on unresolved references.
+- 2026-02-15: Added fail-closed behavior for cross-file verification errors; delete now aborts if any referenced file cannot be inspected.
+- 2026-02-15: Replaced rename path derivation with suffix-safe logic preserving existing delimiter/spacing semantics unless explicit path override is supplied.
+- 2026-02-15: Hardened library reference parsing to accept common response variants (`id`, `fileId`, `file-id`, nested `file` object/string) before cross-file inspection.
+- 2026-02-15: Build validation passed via `npm run build`.

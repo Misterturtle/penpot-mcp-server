@@ -226,6 +226,179 @@ function buildReparentChanges(params: {
   };
 }
 
+interface ShapeTokenBindingArgs {
+  fileId: string;
+  pageId: string;
+  shapeId: string;
+  appliedTokens?: Record<string, string>;
+  mergeAppliedTokens?: boolean;
+  fillIndex?: number;
+  fillColorRefId?: string;
+  fillColorRefFile?: string;
+  clearFillColorRef?: boolean;
+  strokeIndex?: number;
+  strokeColorRefId?: string;
+  strokeColorRefFile?: string;
+  clearStrokeColorRef?: boolean;
+  paragraphIndex?: number;
+  typographyRefId?: string;
+  typographyRefFile?: string;
+  clearTypographyRef?: boolean;
+}
+
+function buildShapeTokenBindingChange(shape: any, args: ShapeTokenBindingArgs) {
+  const change: any = {
+    type: 'mod-obj',
+    id: args.shapeId,
+    pageId: args.pageId,
+    operations: [],
+  };
+  const updatedParts: string[] = [];
+
+  if (args.appliedTokens !== undefined) {
+    if (
+      typeof args.appliedTokens !== 'object' ||
+      args.appliedTokens === null ||
+      Array.isArray(args.appliedTokens)
+    ) {
+      throw new Error('appliedTokens must be an object map');
+    }
+
+    const existingAppliedTokens = shape.appliedTokens || shape['applied-tokens'] || {};
+    const nextAppliedTokens =
+      args.mergeAppliedTokens === false
+        ? args.appliedTokens
+        : {
+            ...existingAppliedTokens,
+            ...args.appliedTokens,
+          };
+
+    change.operations.push({ type: 'set', attr: 'appliedTokens', val: nextAppliedTokens });
+    updatedParts.push('appliedTokens');
+  }
+
+  const updateFillRef =
+    args.fillColorRefId !== undefined ||
+    args.fillColorRefFile !== undefined ||
+    args.clearFillColorRef === true;
+  if (updateFillRef) {
+    const fillIndex = args.fillIndex ?? 0;
+    if (fillIndex < 0) {
+      throw new Error('fillIndex must be 0 or greater');
+    }
+
+    const fills = Array.isArray(shape.fills) ? JSON.parse(JSON.stringify(shape.fills)) : [];
+    while (fills.length <= fillIndex) {
+      fills.push({});
+    }
+
+    if (args.clearFillColorRef) {
+      delete fills[fillIndex].fillColorRefId;
+      delete fills[fillIndex].fillColorRefFile;
+    }
+    if (args.fillColorRefId !== undefined) {
+      fills[fillIndex].fillColorRefId = args.fillColorRefId;
+    }
+    if (args.fillColorRefFile !== undefined) {
+      fills[fillIndex].fillColorRefFile = args.fillColorRefFile;
+    }
+
+    change.operations.push({ type: 'set', attr: 'fills', val: fills });
+    updatedParts.push('fill refs');
+  }
+
+  const updateStrokeRef =
+    args.strokeColorRefId !== undefined ||
+    args.strokeColorRefFile !== undefined ||
+    args.clearStrokeColorRef === true;
+  if (updateStrokeRef) {
+    const strokeIndex = args.strokeIndex ?? 0;
+    if (strokeIndex < 0) {
+      throw new Error('strokeIndex must be 0 or greater');
+    }
+
+    const strokes = Array.isArray(shape.strokes) ? JSON.parse(JSON.stringify(shape.strokes)) : [];
+    while (strokes.length <= strokeIndex) {
+      strokes.push({});
+    }
+
+    if (args.clearStrokeColorRef) {
+      delete strokes[strokeIndex].strokeColorRefId;
+      delete strokes[strokeIndex].strokeColorRefFile;
+    }
+    if (args.strokeColorRefId !== undefined) {
+      strokes[strokeIndex].strokeColorRefId = args.strokeColorRefId;
+    }
+    if (args.strokeColorRefFile !== undefined) {
+      strokes[strokeIndex].strokeColorRefFile = args.strokeColorRefFile;
+    }
+
+    change.operations.push({ type: 'set', attr: 'strokes', val: strokes });
+    updatedParts.push('stroke refs');
+  }
+
+  const updateTypographyRef =
+    args.typographyRefId !== undefined ||
+    args.typographyRefFile !== undefined ||
+    args.clearTypographyRef === true;
+  if (updateTypographyRef) {
+    if (shape.type !== 'text') {
+      throw new Error('Typography refs can only be updated for text shapes');
+    }
+
+    const content = shape.content ? JSON.parse(JSON.stringify(shape.content)) : null;
+    const paragraphs = content?.children?.[0]?.children;
+    if (!Array.isArray(paragraphs) || paragraphs.length === 0) {
+      throw new Error('Text shape has no paragraph structure to update');
+    }
+
+    const paragraphIndexes =
+      args.paragraphIndex !== undefined
+        ? [args.paragraphIndex]
+        : paragraphs.map((_p: any, index: number) => index);
+
+    for (const paragraphIndex of paragraphIndexes) {
+      if (paragraphIndex < 0 || paragraphIndex >= paragraphs.length) {
+        throw new Error(`paragraphIndex out of range: ${paragraphIndex}`);
+      }
+      const paragraph = paragraphs[paragraphIndex];
+      if (args.clearTypographyRef) {
+        delete paragraph.typographyRefId;
+        delete paragraph.typographyRefFile;
+      }
+      if (args.typographyRefId !== undefined) {
+        paragraph.typographyRefId = args.typographyRefId;
+      }
+      if (args.typographyRefFile !== undefined) {
+        paragraph.typographyRefFile = args.typographyRefFile;
+      }
+    }
+
+    change.operations.push({ type: 'set', attr: 'content', val: content });
+    updatedParts.push('typography refs');
+  }
+
+  if (change.operations.length === 0) {
+    throw new Error(
+      'No token binding updates provided. Set appliedTokens and/or fill/stroke/typography ref fields.'
+    );
+  }
+
+  return { change, updatedParts };
+}
+
+function applySetOperationsLocally(shape: any, operations: any[]): any {
+  const nextShape = JSON.parse(JSON.stringify(shape));
+
+  for (const operation of operations) {
+    if (operation?.type === 'set' && typeof operation?.attr === 'string') {
+      nextShape[operation.attr] = operation.val;
+    }
+  }
+
+  return nextShape;
+}
+
 export function createPageAdvancedTools(penpotClient: PenpotClient) {
   return {
     get_page_shapes: {
@@ -1576,25 +1749,7 @@ export function createPageAdvancedTools(penpotClient: PenpotClient) {
         },
         required: ['fileId', 'pageId', 'shapeId'],
       },
-      handler: async (args: {
-        fileId: string;
-        pageId: string;
-        shapeId: string;
-        appliedTokens?: Record<string, string>;
-        mergeAppliedTokens?: boolean;
-        fillIndex?: number;
-        fillColorRefId?: string;
-        fillColorRefFile?: string;
-        clearFillColorRef?: boolean;
-        strokeIndex?: number;
-        strokeColorRefId?: string;
-        strokeColorRefFile?: string;
-        clearStrokeColorRef?: boolean;
-        paragraphIndex?: number;
-        typographyRefId?: string;
-        typographyRefFile?: string;
-        clearTypographyRef?: boolean;
-      }) => {
+      handler: async (args: ShapeTokenBindingArgs) => {
         const { objects } = await getPageContext(penpotClient, args.fileId, args.pageId);
         const shape = objects[args.shapeId];
 
@@ -1602,145 +1757,7 @@ export function createPageAdvancedTools(penpotClient: PenpotClient) {
           throw new Error(`Shape not found: ${args.shapeId}`);
         }
 
-        const change: any = {
-          type: 'mod-obj',
-          id: args.shapeId,
-          pageId: args.pageId,
-          operations: [],
-        };
-        const updatedParts: string[] = [];
-
-        if (args.appliedTokens !== undefined) {
-          if (
-            typeof args.appliedTokens !== 'object' ||
-            args.appliedTokens === null ||
-            Array.isArray(args.appliedTokens)
-          ) {
-            throw new Error('appliedTokens must be an object map');
-          }
-
-          const existingAppliedTokens = shape.appliedTokens || shape['applied-tokens'] || {};
-          const nextAppliedTokens =
-            args.mergeAppliedTokens === false
-              ? args.appliedTokens
-              : {
-                  ...existingAppliedTokens,
-                  ...args.appliedTokens,
-                };
-
-          change.operations.push({ type: 'set', attr: 'appliedTokens', val: nextAppliedTokens });
-          updatedParts.push('appliedTokens');
-        }
-
-        const updateFillRef =
-          args.fillColorRefId !== undefined ||
-          args.fillColorRefFile !== undefined ||
-          args.clearFillColorRef === true;
-        if (updateFillRef) {
-          const fillIndex = args.fillIndex ?? 0;
-          if (fillIndex < 0) {
-            throw new Error('fillIndex must be 0 or greater');
-          }
-
-          const fills = Array.isArray(shape.fills) ? JSON.parse(JSON.stringify(shape.fills)) : [];
-          while (fills.length <= fillIndex) {
-            fills.push({});
-          }
-
-          if (args.clearFillColorRef) {
-            delete fills[fillIndex].fillColorRefId;
-            delete fills[fillIndex].fillColorRefFile;
-          }
-          if (args.fillColorRefId !== undefined) {
-            fills[fillIndex].fillColorRefId = args.fillColorRefId;
-          }
-          if (args.fillColorRefFile !== undefined) {
-            fills[fillIndex].fillColorRefFile = args.fillColorRefFile;
-          }
-
-          change.operations.push({ type: 'set', attr: 'fills', val: fills });
-          updatedParts.push('fill refs');
-        }
-
-        const updateStrokeRef =
-          args.strokeColorRefId !== undefined ||
-          args.strokeColorRefFile !== undefined ||
-          args.clearStrokeColorRef === true;
-        if (updateStrokeRef) {
-          const strokeIndex = args.strokeIndex ?? 0;
-          if (strokeIndex < 0) {
-            throw new Error('strokeIndex must be 0 or greater');
-          }
-
-          const strokes = Array.isArray(shape.strokes)
-            ? JSON.parse(JSON.stringify(shape.strokes))
-            : [];
-          while (strokes.length <= strokeIndex) {
-            strokes.push({});
-          }
-
-          if (args.clearStrokeColorRef) {
-            delete strokes[strokeIndex].strokeColorRefId;
-            delete strokes[strokeIndex].strokeColorRefFile;
-          }
-          if (args.strokeColorRefId !== undefined) {
-            strokes[strokeIndex].strokeColorRefId = args.strokeColorRefId;
-          }
-          if (args.strokeColorRefFile !== undefined) {
-            strokes[strokeIndex].strokeColorRefFile = args.strokeColorRefFile;
-          }
-
-          change.operations.push({ type: 'set', attr: 'strokes', val: strokes });
-          updatedParts.push('stroke refs');
-        }
-
-        const updateTypographyRef =
-          args.typographyRefId !== undefined ||
-          args.typographyRefFile !== undefined ||
-          args.clearTypographyRef === true;
-        if (updateTypographyRef) {
-          if (shape.type !== 'text') {
-            throw new Error('Typography refs can only be updated for text shapes');
-          }
-
-          const content = shape.content ? JSON.parse(JSON.stringify(shape.content)) : null;
-          const paragraphs = content?.children?.[0]?.children;
-          if (!Array.isArray(paragraphs) || paragraphs.length === 0) {
-            throw new Error('Text shape has no paragraph structure to update');
-          }
-
-          const paragraphIndexes =
-            args.paragraphIndex !== undefined
-              ? [args.paragraphIndex]
-              : paragraphs.map((_p: any, index: number) => index);
-
-          for (const paragraphIndex of paragraphIndexes) {
-            if (paragraphIndex < 0 || paragraphIndex >= paragraphs.length) {
-              throw new Error(`paragraphIndex out of range: ${paragraphIndex}`);
-            }
-            const paragraph = paragraphs[paragraphIndex];
-            if (args.clearTypographyRef) {
-              delete paragraph.typographyRefId;
-              delete paragraph.typographyRefFile;
-            }
-            if (args.typographyRefId !== undefined) {
-              paragraph.typographyRefId = args.typographyRefId;
-            }
-            if (args.typographyRefFile !== undefined) {
-              paragraph.typographyRefFile = args.typographyRefFile;
-            }
-          }
-
-          change.operations.push({ type: 'set', attr: 'content', val: content });
-          updatedParts.push('typography refs');
-        }
-
-        if (change.operations.length === 0) {
-          throw new Error(
-            'No token binding updates provided. Set appliedTokens and/or fill/stroke/typography ref fields.'
-          );
-        }
-
+        const { change, updatedParts } = buildShapeTokenBindingChange(shape, args);
         await penpotClient.applyChanges(args.fileId, [change]);
 
         return {
@@ -1748,6 +1765,184 @@ export function createPageAdvancedTools(penpotClient: PenpotClient) {
             {
               type: 'text',
               text: `Updated token bindings for shape ${args.shapeId}: ${updatedParts.join(', ')}`,
+            },
+          ],
+        };
+      },
+    },
+
+    batch_set_shape_token_bindings: {
+      description:
+        'Set token bindings for multiple shapes in one request with per-item success/failure reporting',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          items: {
+            type: 'array',
+            description: 'Array of shape token binding updates',
+            minItems: 1,
+            items: {
+              type: 'object',
+              properties: {
+                fileId: { type: 'string', description: 'File ID' },
+                pageId: { type: 'string', description: 'Page ID' },
+                shapeId: { type: 'string', description: 'Shape ID' },
+                appliedTokens: {
+                  type: 'object',
+                  description:
+                    'Token refs map to assign to shape.appliedTokens (e.g., {"r1":"radius.sm","fill":"color.primary"})',
+                  additionalProperties: { type: 'string' },
+                },
+                mergeAppliedTokens: {
+                  type: 'boolean',
+                  description: 'Merge with existing appliedTokens (default true)',
+                  default: true,
+                },
+                fillIndex: { type: 'number', description: 'Fill index to update (default 0)' },
+                fillColorRefId: {
+                  type: 'string',
+                  description: 'Fill token/color style reference ID',
+                },
+                fillColorRefFile: { type: 'string', description: 'File ID for fillColorRefId' },
+                clearFillColorRef: {
+                  type: 'boolean',
+                  description: 'Clear fill color reference fields',
+                },
+                strokeIndex: { type: 'number', description: 'Stroke index to update (default 0)' },
+                strokeColorRefId: {
+                  type: 'string',
+                  description: 'Stroke token/color style reference ID',
+                },
+                strokeColorRefFile: {
+                  type: 'string',
+                  description: 'File ID for strokeColorRefId',
+                },
+                clearStrokeColorRef: {
+                  type: 'boolean',
+                  description: 'Clear stroke color reference fields',
+                },
+                paragraphIndex: {
+                  type: 'number',
+                  description: 'Text paragraph index for typography refs (default: all paragraphs)',
+                },
+                typographyRefId: {
+                  type: 'string',
+                  description: 'Typography reference ID for text paragraphs',
+                },
+                typographyRefFile: { type: 'string', description: 'File ID for typographyRefId' },
+                clearTypographyRef: {
+                  type: 'boolean',
+                  description: 'Clear typography reference fields',
+                },
+              },
+              required: ['fileId', 'pageId', 'shapeId'],
+            },
+          },
+          continueOnError: {
+            type: 'boolean',
+            description: 'Continue processing after item failures (default true)',
+            default: true,
+          },
+        },
+        required: ['items'],
+      },
+      handler: async (args: { items: ShapeTokenBindingArgs[]; continueOnError?: boolean }) => {
+        if (!Array.isArray(args.items) || args.items.length === 0) {
+          throw new Error('items must be a non-empty array');
+        }
+
+        const continueOnError = args.continueOnError !== false;
+        const pageObjectsCache = new Map<string, Record<string, any>>();
+        const results: Array<Record<string, any>> = [];
+        let successCount = 0;
+        let failureCount = 0;
+        let abortRemaining = false;
+
+        for (let index = 0; index < args.items.length; index += 1) {
+          const item = args.items[index];
+
+          if (abortRemaining) {
+            results.push({
+              index,
+              status: 'skipped',
+              fileId: item?.fileId || null,
+              pageId: item?.pageId || null,
+              shapeId: item?.shapeId || null,
+              error: 'Skipped because continueOnError=false and a previous item failed',
+            });
+            continue;
+          }
+
+          try {
+            if (!item?.fileId || !item?.pageId || !item?.shapeId) {
+              throw new Error('Each item must include fileId, pageId, and shapeId');
+            }
+
+            const pageCacheKey = `${item.fileId}:${item.pageId}`;
+            if (!pageObjectsCache.has(pageCacheKey)) {
+              const { objects } = await getPageContext(penpotClient, item.fileId, item.pageId);
+              pageObjectsCache.set(pageCacheKey, objects);
+            }
+
+            const objects = pageObjectsCache.get(pageCacheKey)!;
+            const shape = objects[item.shapeId];
+            if (!shape) {
+              throw new Error(`Shape not found: ${item.shapeId}`);
+            }
+
+            const { change, updatedParts } = buildShapeTokenBindingChange(shape, item);
+            await penpotClient.applyChanges(item.fileId, [change]);
+            objects[item.shapeId] = applySetOperationsLocally(shape, change.operations || []);
+
+            results.push({
+              index,
+              status: 'success',
+              fileId: item.fileId,
+              pageId: item.pageId,
+              shapeId: item.shapeId,
+              updatedParts,
+            });
+            successCount += 1;
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            results.push({
+              index,
+              status: 'error',
+              fileId: item?.fileId || null,
+              pageId: item?.pageId || null,
+              shapeId: item?.shapeId || null,
+              error: message,
+            });
+            failureCount += 1;
+
+            if (!continueOnError) {
+              abortRemaining = true;
+            }
+          }
+        }
+
+        const skippedCount = results.filter((result) => result.status === 'skipped').length;
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Batch set_shape_token_bindings completed: ${successCount} succeeded, ${failureCount} failed, ${skippedCount} skipped (${args.items.length} total)`,
+            },
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  total: args.items.length,
+                  successCount,
+                  failureCount,
+                  skippedCount,
+                  continueOnError,
+                  results,
+                },
+                null,
+                2
+              ),
             },
           ],
         };
@@ -1779,6 +1974,143 @@ export function createPageAdvancedTools(penpotClient: PenpotClient) {
             {
               type: 'text',
               text: `Deleted shape: ${args.shapeId}`,
+            },
+          ],
+        };
+      },
+    },
+
+    batch_delete_shape: {
+      description: 'Delete multiple shapes with per-item success/failure reporting',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          items: {
+            type: 'array',
+            description: 'Array of shape deletion operations',
+            minItems: 1,
+            items: {
+              type: 'object',
+              properties: {
+                fileId: { type: 'string', description: 'File ID' },
+                pageId: { type: 'string', description: 'Page ID' },
+                shapeId: { type: 'string', description: 'Shape ID' },
+              },
+              required: ['fileId', 'pageId', 'shapeId'],
+            },
+          },
+          continueOnError: {
+            type: 'boolean',
+            description: 'Continue processing after item failures (default true)',
+            default: true,
+          },
+        },
+        required: ['items'],
+      },
+      handler: async (args: {
+        items: Array<{ fileId: string; pageId: string; shapeId: string }>;
+        continueOnError?: boolean;
+      }) => {
+        if (!Array.isArray(args.items) || args.items.length === 0) {
+          throw new Error('items must be a non-empty array');
+        }
+
+        const continueOnError = args.continueOnError !== false;
+        const pageObjectsCache = new Map<string, Record<string, any>>();
+        const results: Array<Record<string, any>> = [];
+        let successCount = 0;
+        let failureCount = 0;
+        let abortRemaining = false;
+
+        for (let index = 0; index < args.items.length; index += 1) {
+          const item = args.items[index];
+
+          if (abortRemaining) {
+            results.push({
+              index,
+              status: 'skipped',
+              fileId: item?.fileId || null,
+              pageId: item?.pageId || null,
+              shapeId: item?.shapeId || null,
+              error: 'Skipped because continueOnError=false and a previous item failed',
+            });
+            continue;
+          }
+
+          try {
+            if (!item?.fileId || !item?.pageId || !item?.shapeId) {
+              throw new Error('Each item must include fileId, pageId, and shapeId');
+            }
+
+            const pageCacheKey = `${item.fileId}:${item.pageId}`;
+            if (!pageObjectsCache.has(pageCacheKey)) {
+              const { objects } = await getPageContext(penpotClient, item.fileId, item.pageId);
+              pageObjectsCache.set(pageCacheKey, objects);
+            }
+
+            const objects = pageObjectsCache.get(pageCacheKey)!;
+            if (!objects[item.shapeId]) {
+              throw new Error(`Shape not found: ${item.shapeId}`);
+            }
+
+            await penpotClient.applyChanges(item.fileId, [
+              {
+                type: 'del-obj',
+                id: item.shapeId,
+                pageId: item.pageId,
+              },
+            ] as any);
+
+            delete objects[item.shapeId];
+
+            results.push({
+              index,
+              status: 'success',
+              fileId: item.fileId,
+              pageId: item.pageId,
+              shapeId: item.shapeId,
+            });
+            successCount += 1;
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            results.push({
+              index,
+              status: 'error',
+              fileId: item?.fileId || null,
+              pageId: item?.pageId || null,
+              shapeId: item?.shapeId || null,
+              error: message,
+            });
+            failureCount += 1;
+
+            if (!continueOnError) {
+              abortRemaining = true;
+            }
+          }
+        }
+
+        const skippedCount = results.filter((result) => result.status === 'skipped').length;
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Batch delete_shape completed: ${successCount} succeeded, ${failureCount} failed, ${skippedCount} skipped (${args.items.length} total)`,
+            },
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  total: args.items.length,
+                  successCount,
+                  failureCount,
+                  skippedCount,
+                  continueOnError,
+                  results,
+                },
+                null,
+                2
+              ),
             },
           ],
         };

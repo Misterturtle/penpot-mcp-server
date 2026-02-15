@@ -312,6 +312,78 @@ function deriveRenamedComponentPath(existingPath: string | undefined, newName: s
   return pathParts.join('/');
 }
 
+interface InstantiateComponentArgs {
+  fileId: string;
+  pageId: string;
+  componentId: string;
+  componentFile: string;
+  x?: number;
+  y?: number;
+  parentId?: string;
+  index?: number;
+  sessionId?: string;
+  skipValidate?: boolean;
+}
+
+interface InstantiateComponentSourceStatus {
+  isShellContainer: boolean;
+  rootType: string | null;
+}
+
+async function instantiateComponent(
+  penpotClient: PenpotClient,
+  args: InstantiateComponentArgs,
+  sourceStatusCache?: Map<string, InstantiateComponentSourceStatus>
+) {
+  const sourceCacheKey = `${args.componentFile}:${args.componentId}`;
+  let sourceStatus = sourceStatusCache?.get(sourceCacheKey);
+
+  if (!sourceStatus) {
+    const sourceCtx = await resolveComponentRootContext({
+      penpotClient,
+      fileId: args.componentFile,
+      componentId: args.componentId,
+    });
+
+    sourceStatus = {
+      isShellContainer: sourceCtx.integrity.isShellContainer,
+      rootType: typeof sourceCtx.rootShape?.type === 'string' ? sourceCtx.rootShape.type : null,
+    };
+
+    sourceStatusCache?.set(sourceCacheKey, sourceStatus);
+  }
+
+  if (sourceStatus.isShellContainer) {
+    throw new Error(
+      `Component ${args.componentId} is a shell ${sourceStatus.rootType || 'container'} with no nested children. Repair source structure before instantiating cross-file.`
+    );
+  }
+
+  const response = await penpotClient.client.post({
+    url: '/command/instantiate-component',
+    body: {
+      fileId: args.fileId,
+      pageId: args.pageId,
+      componentId: args.componentId,
+      componentFile: args.componentFile,
+      position: {
+        x: args.x ?? 0,
+        y: args.y ?? 0,
+      },
+      ...(args.parentId && { parentId: args.parentId }),
+      ...(args.index !== undefined && { index: args.index }),
+      ...(args.sessionId && { sessionId: args.sessionId }),
+      ...(args.skipValidate !== undefined && { skipValidate: args.skipValidate }),
+    } as any,
+  });
+
+  if (response.error) {
+    throw new Error(`Failed to instantiate component: ${JSON.stringify(response.error)}`);
+  }
+
+  return response.data;
+}
+
 export function createComponentTools(penpotClient: PenpotClient) {
   return {
     inspect_component_structure: {
@@ -622,52 +694,8 @@ export function createComponentTools(penpotClient: PenpotClient) {
         },
         required: ['fileId', 'pageId', 'componentId', 'componentFile'],
       },
-      handler: async (args: {
-        fileId: string;
-        pageId: string;
-        componentId: string;
-        componentFile: string;
-        x?: number;
-        y?: number;
-        parentId?: string;
-        index?: number;
-        sessionId?: string;
-        skipValidate?: boolean;
-      }) => {
-        const sourceCtx = await resolveComponentRootContext({
-          penpotClient,
-          fileId: args.componentFile,
-          componentId: args.componentId,
-        });
-
-        if (sourceCtx.integrity.isShellContainer) {
-          throw new Error(
-            `Component ${args.componentId} is a shell ${sourceCtx.rootShape.type} with no nested children. Repair source structure before instantiating cross-file.`
-          );
-        }
-
-        const response = await penpotClient.client.post({
-          url: '/command/instantiate-component',
-          body: {
-            fileId: args.fileId,
-            pageId: args.pageId,
-            componentId: args.componentId,
-            componentFile: args.componentFile,
-            position: {
-              x: args.x ?? 0,
-              y: args.y ?? 0,
-            },
-            ...(args.parentId && { parentId: args.parentId }),
-            ...(args.index !== undefined && { index: args.index }),
-            ...(args.sessionId && { sessionId: args.sessionId }),
-            ...(args.skipValidate !== undefined && { skipValidate: args.skipValidate }),
-          } as any,
-        });
-
-        if (response.error) {
-          throw new Error(`Failed to instantiate component: ${JSON.stringify(response.error)}`);
-        }
-
+      handler: async (args: InstantiateComponentArgs) => {
+        const data = await instantiateComponent(penpotClient, args);
         return {
           content: [
             {
@@ -676,7 +704,146 @@ export function createComponentTools(penpotClient: PenpotClient) {
             },
             {
               type: 'text',
-              text: JSON.stringify(response.data, null, 2),
+              text: JSON.stringify(data, null, 2),
+            },
+          ],
+        };
+      },
+    },
+
+    batch_instantiate_component: {
+      description:
+        'Instantiate multiple components in one request with per-item success/failure reporting',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          items: {
+            type: 'array',
+            description: 'Array of component instantiation operations',
+            minItems: 1,
+            items: {
+              type: 'object',
+              properties: {
+                fileId: { type: 'string', description: 'Target file ID' },
+                pageId: { type: 'string', description: 'Target page ID' },
+                componentId: { type: 'string', description: 'Component ID to instantiate' },
+                componentFile: {
+                  type: 'string',
+                  description: 'File ID where the component is defined',
+                },
+                x: { type: 'number', description: 'X position', default: 0 },
+                y: { type: 'number', description: 'Y position', default: 0 },
+                parentId: {
+                  type: 'string',
+                  description: 'Optional parent shape ID where the instance should be inserted',
+                },
+                index: {
+                  type: 'number',
+                  description: 'Optional insertion index in the parent children list',
+                },
+                sessionId: {
+                  type: 'string',
+                  description: 'Optional session ID for server-side operation tracking',
+                },
+                skipValidate: {
+                  type: 'boolean',
+                  description: 'Skip server-side validation checks',
+                },
+              },
+              required: ['fileId', 'pageId', 'componentId', 'componentFile'],
+            },
+          },
+          continueOnError: {
+            type: 'boolean',
+            description: 'Continue processing after item failures (default true)',
+            default: true,
+          },
+        },
+        required: ['items'],
+      },
+      handler: async (args: { items: InstantiateComponentArgs[]; continueOnError?: boolean }) => {
+        if (!Array.isArray(args.items) || args.items.length === 0) {
+          throw new Error('items must be a non-empty array');
+        }
+
+        const continueOnError = args.continueOnError !== false;
+        const sourceStatusCache = new Map<string, InstantiateComponentSourceStatus>();
+        const results: Array<Record<string, any>> = [];
+        let successCount = 0;
+        let failureCount = 0;
+        let stopIndex = -1;
+
+        for (let index = 0; index < args.items.length; index += 1) {
+          const item = args.items[index];
+          try {
+            const data = await instantiateComponent(penpotClient, item, sourceStatusCache);
+            results.push({
+              index,
+              status: 'success',
+              fileId: item.fileId,
+              pageId: item.pageId,
+              componentId: item.componentId,
+              componentFile: item.componentFile,
+              data,
+            });
+            successCount += 1;
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            results.push({
+              index,
+              status: 'error',
+              fileId: item.fileId,
+              pageId: item.pageId,
+              componentId: item.componentId,
+              componentFile: item.componentFile,
+              error: message,
+            });
+            failureCount += 1;
+
+            if (!continueOnError) {
+              stopIndex = index;
+              break;
+            }
+          }
+        }
+
+        if (stopIndex >= 0) {
+          for (let index = stopIndex + 1; index < args.items.length; index += 1) {
+            const item = args.items[index];
+            results.push({
+              index,
+              status: 'skipped',
+              fileId: item.fileId,
+              pageId: item.pageId,
+              componentId: item.componentId,
+              componentFile: item.componentFile,
+              error: 'Skipped because continueOnError=false and a previous item failed',
+            });
+          }
+        }
+
+        const skippedCount = results.filter((result) => result.status === 'skipped').length;
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Batch instantiate completed: ${successCount} succeeded, ${failureCount} failed, ${skippedCount} skipped (${args.items.length} total)`,
+            },
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  total: args.items.length,
+                  successCount,
+                  failureCount,
+                  skippedCount,
+                  continueOnError,
+                  results,
+                },
+                null,
+                2
+              ),
             },
           ],
         };

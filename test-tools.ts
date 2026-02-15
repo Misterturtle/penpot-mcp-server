@@ -337,7 +337,7 @@ async function runTests() {
       fileId: testState.fileId,
       pageId: testState.pageId,
       name: 'Test Text',
-      content: 'Hello Penpot MCP!',
+      text: 'Hello Penpot MCP!',
       x: 100,
       y: 300,
       fillColor: '#000000',
@@ -399,6 +399,39 @@ async function runTests() {
       throw new Error('Text shape update failed');
     }
     log(`  Updated text shape with alignment and font properties`, 'info');
+  });
+
+  await runTest('Update text shape content in-place', async () => {
+    const textShapeId = testState.shapeIds[3];
+    const updatedText = 'In-place text update';
+    const result = await pageAdvancedTools.update_shape.handler({
+      fileId: testState.fileId,
+      pageId: testState.pageId,
+      shapeId: textShapeId,
+      text: updatedText,
+    });
+    const text = result.content[0].text;
+    if (!text.includes('Updated shape')) {
+      throw new Error('Text content update failed');
+    }
+
+    const propsResult = await pageAdvancedTools.get_shape_properties.handler({
+      fileId: testState.fileId,
+      pageId: testState.pageId,
+      shapeId: textShapeId,
+    });
+    const props = JSON.parse(propsResult.content[1].text);
+    if (props.id !== textShapeId) {
+      throw new Error('Shape ID changed after text content update');
+    }
+    if (props.text?.content !== updatedText) {
+      throw new Error(`Unexpected text content: ${props.text?.content}`);
+    }
+    if (props.text?.fontWeight !== 'bold') {
+      throw new Error('Text style changed unexpectedly after content update');
+    }
+
+    log(`  Updated text content while preserving shape identity/style`, 'info');
   });
 
   await runTest('Get shape properties', async () => {

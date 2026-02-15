@@ -65,7 +65,7 @@ The screenshot above demonstrates how you can describe a design in natural langu
 
 #### Shape Manipulation (6 tools)
 
-- `update_shape` - Modify shape properties (position, size, style, etc.)
+- `update_shape` - Modify shape properties (position, size, style, text content, etc.)
 - `delete_shape` - Remove shapes from the design
 - `group_shapes` - Group multiple shapes
 - `get_shape_token_bindings` - Inspect token bindings for a shape

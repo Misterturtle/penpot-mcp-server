@@ -9,7 +9,7 @@ A Model Context Protocol (MCP) server that provides full manipulation capabiliti
 
 ## 🎬 See It In Action
 
-![Chat Interface Example](docs/delete_rename_list_components_instances/screenshot.png)
+![Chat Interface Example](docs/01-component-lifecycle-management/screenshot.png)
 
 _Example chat interface created entirely through natural conversation with an AI assistant using this MCP server. See [Example 7: Chat Interface](EXAMPLES.md#-example-7-chat-interface) for the complete conversation that generated this design._
 

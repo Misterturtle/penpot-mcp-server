@@ -225,6 +225,47 @@ interface ComponentInstanceRecord {
   isComponentRoot: boolean;
 }
 
+function listComponentInstancesBySourceFile(args: {
+  fileId: string;
+  data: any;
+  sourceFileId: string;
+}): ComponentInstanceRecord[] {
+  const pagesIndex = getPagesIndex(args.data);
+  const instances: ComponentInstanceRecord[] = [];
+
+  for (const [pageId, page] of Object.entries(pagesIndex) as [string, any][]) {
+    const pageName = typeof page?.name === 'string' ? page.name : null;
+    const objects = page?.objects || {};
+
+    for (const [shapeId, shape] of Object.entries(objects) as [string, any][]) {
+      const shapeComponentId = getShapeComponentId(shape);
+      if (!shapeComponentId) {
+        continue;
+      }
+
+      const shapeComponentFile = getShapeComponentFile(shape);
+      if (shapeComponentFile !== args.sourceFileId) {
+        continue;
+      }
+
+      instances.push({
+        fileId: args.fileId,
+        pageId,
+        pageName,
+        shapeId,
+        shapeName: typeof shape?.name === 'string' ? shape.name : null,
+        shapeType: typeof shape?.type === 'string' ? shape.type : null,
+        componentId: shapeComponentId,
+        componentFile: shapeComponentFile,
+        isMainInstance: isShapeMainInstance(shape),
+        isComponentRoot: isShapeComponentRoot(shape),
+      });
+    }
+  }
+
+  return instances;
+}
+
 function listComponentInstancesFromData(args: {
   fileId: string;
   data: any;
@@ -368,6 +409,99 @@ function listReferencingFileIds(libraryReferences: unknown, sourceFileId: string
   return [...ids];
 }
 
+interface CrossFileInspectionError {
+  fileId: string;
+  error: string;
+}
+
+interface CrossFileUsageInspectionResult {
+  sourceFileId: string;
+  referencingFileIds: string[];
+  inspectedFileIds: string[];
+  errors: CrossFileInspectionError[];
+  instancesByComponentId: Map<string, ComponentInstanceRecord[]>;
+}
+
+async function inspectCrossFileComponentUsage(args: {
+  penpotClient: PenpotClient;
+  sourceFileId: string;
+}): Promise<CrossFileUsageInspectionResult> {
+  const libraryReferencesResult = await postCommandGetLibraryFileReferences({
+    client: args.penpotClient.client,
+    body: { fileId: args.sourceFileId },
+  });
+
+  if (libraryReferencesResult.error) {
+    throw new Error(
+      `Failed to inspect library file references for ${args.sourceFileId}: ${JSON.stringify(libraryReferencesResult.error)}`
+    );
+  }
+
+  const referencingFileIds = listReferencingFileIds(
+    libraryReferencesResult.data,
+    args.sourceFileId
+  );
+  if (referencingFileIds.length === 0) {
+    return {
+      sourceFileId: args.sourceFileId,
+      referencingFileIds: [],
+      inspectedFileIds: [],
+      errors: [],
+      instancesByComponentId: new Map<string, ComponentInstanceRecord[]>(),
+    };
+  }
+
+  const inspections = await Promise.all(
+    referencingFileIds.map(async (fileId) => {
+      try {
+        const consumerFile = await args.penpotClient.getFile(fileId);
+        const consumerData = consumerFile.data as any;
+        const crossFileInstances = listComponentInstancesBySourceFile({
+          fileId,
+          data: consumerData,
+          sourceFileId: args.sourceFileId,
+        }).filter((instance) => !instance.isMainInstance);
+
+        return {
+          fileId,
+          instances: crossFileInstances,
+          error: null as string | null,
+        };
+      } catch (error) {
+        return {
+          fileId,
+          instances: [] as ComponentInstanceRecord[],
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+    })
+  );
+
+  const errors = inspections
+    .filter((inspection) => inspection.error)
+    .map((inspection) => ({
+      fileId: inspection.fileId,
+      error: inspection.error || 'Unknown error',
+    }));
+
+  const instancesByComponentId = new Map<string, ComponentInstanceRecord[]>();
+  for (const inspection of inspections) {
+    for (const instance of inspection.instances) {
+      const bucket = instancesByComponentId.get(instance.componentId) || [];
+      bucket.push(instance);
+      instancesByComponentId.set(instance.componentId, bucket);
+    }
+  }
+
+  return {
+    sourceFileId: args.sourceFileId,
+    referencingFileIds,
+    inspectedFileIds: inspections.filter((inspection) => !inspection.error).map((i) => i.fileId),
+    errors,
+    instancesByComponentId,
+  };
+}
+
 interface InstantiateComponentArgs {
   fileId: string;
   pageId: string;
@@ -485,9 +619,13 @@ interface ComponentRegistryEntry {
   mainInstancePage: string | null;
   totalInstanceCount: number;
   activeInstanceCount: number;
+  inFileActiveInstanceCount: number;
+  crossFileActiveInstanceCount: number;
   isOrphaned: boolean;
   deletable: boolean;
   activeInstancePageIds: string[];
+  activeInstanceFileIds: string[];
+  activeInstanceLocations: string[];
   activeInstancesSample: ComponentInstanceRecord[];
   instances?: ComponentInstanceRecord[];
 }
@@ -495,6 +633,7 @@ interface ComponentRegistryEntry {
 function summarizeComponentRegistry(args: {
   fileId: string;
   data: any;
+  crossFileInstancesByComponentId?: Map<string, ComponentInstanceRecord[]>;
   namePattern?: string;
   pathPattern?: string;
   onlyOrphaned?: boolean;
@@ -535,8 +674,14 @@ function summarizeComponentRegistry(args: {
       componentId,
       includeMainInstance: true,
     });
+    const crossFileInstances = args.crossFileInstancesByComponentId?.get(componentId) || [];
+    const allInstances = [...instances, ...crossFileInstances];
 
-    const activeInstances = instances.filter((instance) => !instance.isMainInstance);
+    const activeInstances = allInstances.filter((instance) => !instance.isMainInstance);
+    const inFileActiveInstanceCount = activeInstances.filter(
+      (instance) => instance.fileId === args.fileId
+    ).length;
+    const crossFileActiveInstanceCount = activeInstances.length - inFileActiveInstanceCount;
     const activeInstanceCount = activeInstances.length;
 
     if (args.onlyOrphaned === true && activeInstanceCount > 0) {
@@ -552,13 +697,19 @@ function summarizeComponentRegistry(args: {
       path,
       mainInstanceId: getComponentMainInstanceId(component) || null,
       mainInstancePage: getComponentMainInstancePage(component) || null,
-      totalInstanceCount: instances.length,
+      totalInstanceCount: allInstances.length,
       activeInstanceCount,
+      inFileActiveInstanceCount,
+      crossFileActiveInstanceCount,
       isOrphaned: activeInstanceCount === 0,
       deletable: activeInstanceCount === 0,
       activeInstancePageIds: [...new Set(activeInstances.map((instance) => instance.pageId))],
+      activeInstanceFileIds: [...new Set(activeInstances.map((instance) => instance.fileId))],
+      activeInstanceLocations: [
+        ...new Set(activeInstances.map((instance) => `${instance.fileId}:${instance.pageId}`)),
+      ],
       activeInstancesSample: activeInstances.slice(0, sampleLimit),
-      ...(args.includeInstances ? { instances } : {}),
+      ...(args.includeInstances ? { instances: allInstances } : {}),
     });
   }
 
@@ -1464,10 +1615,24 @@ export function createComponentTools(penpotClient: PenpotClient) {
       }) => {
         const file = await penpotClient.getFile(args.fileId);
         const data = file.data as any;
+        const crossFileUsage = await inspectCrossFileComponentUsage({
+          penpotClient,
+          sourceFileId: args.fileId,
+        });
+        if (crossFileUsage.errors.length > 0) {
+          throw new Error(
+            `Cannot verify all cross-file usage for query_components on source file ${args.fileId}.\n${JSON.stringify(
+              crossFileUsage.errors,
+              null,
+              2
+            )}`
+          );
+        }
 
         const components = summarizeComponentRegistry({
           fileId: args.fileId,
           data,
+          crossFileInstancesByComponentId: crossFileUsage.instancesByComponentId,
           namePattern: args.namePattern,
           pathPattern: args.pathPattern,
           onlyOrphaned: args.onlyOrphaned,
@@ -1489,6 +1654,11 @@ export function createComponentTools(penpotClient: PenpotClient) {
               text: JSON.stringify(
                 {
                   fileId: args.fileId,
+                  crossFileInspection: {
+                    referencingFileCount: crossFileUsage.referencingFileIds.length,
+                    inspectedFileCount: crossFileUsage.inspectedFileIds.length,
+                    referencingFileIds: crossFileUsage.referencingFileIds,
+                  },
                   filters: {
                     namePattern: args.namePattern || null,
                     pathPattern: args.pathPattern || null,
@@ -1554,10 +1724,24 @@ export function createComponentTools(penpotClient: PenpotClient) {
         const file = await penpotClient.getFile(args.fileId);
         const data = file.data as any;
         const maxActiveInstances = args.maxActiveInstances ?? 0;
+        const crossFileUsage = await inspectCrossFileComponentUsage({
+          penpotClient,
+          sourceFileId: args.fileId,
+        });
+        if (crossFileUsage.errors.length > 0) {
+          throw new Error(
+            `Cannot verify all cross-file usage for list_orphan_components on source file ${args.fileId}.\n${JSON.stringify(
+              crossFileUsage.errors,
+              null,
+              2
+            )}`
+          );
+        }
 
         const components = summarizeComponentRegistry({
           fileId: args.fileId,
           data,
+          crossFileInstancesByComponentId: crossFileUsage.instancesByComponentId,
           namePattern: args.namePattern,
           pathPattern: args.pathPattern,
           maxActiveInstances,
@@ -1579,6 +1763,11 @@ export function createComponentTools(penpotClient: PenpotClient) {
                 {
                   fileId: args.fileId,
                   maxActiveInstances,
+                  crossFileInspection: {
+                    referencingFileCount: crossFileUsage.referencingFileIds.length,
+                    inspectedFileCount: crossFileUsage.inspectedFileIds.length,
+                    referencingFileIds: crossFileUsage.referencingFileIds,
+                  },
                   filters: {
                     namePattern: args.namePattern || null,
                     pathPattern: args.pathPattern || null,

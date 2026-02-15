@@ -625,11 +625,18 @@ async function runTests() {
     if (!Array.isArray(payload.components)) {
       throw new Error('Invalid component query payload');
     }
-    const found = payload.components.some(
+    const matched = payload.components.find(
       (component: any) => component.componentId === testState.componentId
     );
-    if (!found) {
+    if (!matched) {
       throw new Error('Expected renamed component not found in query');
+    }
+    if (
+      typeof matched.activeInstanceCount !== 'number' ||
+      typeof matched.inFileActiveInstanceCount !== 'number' ||
+      typeof matched.crossFileActiveInstanceCount !== 'number'
+    ) {
+      throw new Error('Missing usage summary fields in component query payload');
     }
     log(`  Query returned ${payload.components.length} component(s)`, 'info');
   });
@@ -643,11 +650,14 @@ async function runTests() {
     if (!Array.isArray(payload.components)) {
       throw new Error('Invalid orphan listing payload');
     }
-    const foundOrphan = payload.components.some(
-      (component: any) => component.componentId === testState.componentId && component.isOrphaned
+    const matched = payload.components.find(
+      (component: any) => component.componentId === testState.componentId
     );
-    if (!foundOrphan) {
+    if (!matched || !matched.isOrphaned) {
       throw new Error('Expected orphaned component not found');
+    }
+    if (!Array.isArray(matched.activeInstanceFileIds)) {
+      throw new Error('Missing activeInstanceFileIds in orphan listing payload');
     }
     log(`  Orphan query returned ${payload.components.length} candidate(s)`, 'info');
   });

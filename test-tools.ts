@@ -27,6 +27,8 @@ const testState = {
   projectId: '',
   fileId: '',
   pageId: '',
+  tempPageId: '',
+  duplicatedPageId: '',
   shapeIds: [] as string[],
   componentId: '',
   mediaId: '',
@@ -267,8 +269,53 @@ async function runTests() {
       name: 'Test Page 2',
     });
     const text = result.content[0].text;
+    const match = text.match(/ID:\s*([a-f0-9-]+)/i);
+    if (!match) throw new Error('No page ID in add_page response');
+    testState.tempPageId = match[1];
     if (!text.includes('Added page')) {
       throw new Error('Page creation failed');
+    }
+    log(`  ${text}`, 'info');
+  });
+
+  await runTest('Rename page', async () => {
+    const result = await pageTools.rename_page.handler({
+      fileId: testState.fileId,
+      pageId: testState.tempPageId,
+      name: 'Renamed Test Page 2',
+    });
+    const text = result.content[0].text;
+    if (!text.includes('Renamed page')) {
+      throw new Error('Page rename failed');
+    }
+    log(`  ${text}`, 'info');
+  });
+
+  await runTest('Duplicate page', async () => {
+    const result = await pageTools.duplicate_page.handler({
+      fileId: testState.fileId,
+      pageId: testState.tempPageId,
+    });
+    const text = result.content[0].text;
+    const ids = Array.from(text.matchAll(/ID:\s*([a-f0-9-]+)/gi)).map((match) => match[1]);
+    if (ids.length < 2) {
+      throw new Error('No duplicated page ID in duplicate_page response');
+    }
+    testState.duplicatedPageId = ids[ids.length - 1];
+    if (!text.includes('Duplicated page')) {
+      throw new Error('Page duplicate failed');
+    }
+    log(`  ${text}`, 'info');
+  });
+
+  await runTest('Delete duplicated page', async () => {
+    const result = await pageTools.delete_page.handler({
+      fileId: testState.fileId,
+      pageId: testState.duplicatedPageId,
+    });
+    const text = result.content[0].text;
+    if (!text.includes('Deleted page')) {
+      throw new Error('Page deletion failed');
     }
     log(`  ${text}`, 'info');
   });

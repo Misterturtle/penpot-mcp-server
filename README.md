@@ -77,7 +77,7 @@ The screenshot above demonstrates how you can describe a design in natural langu
 - `align_shapes` - Align multiple shapes (left, center, right, top, middle, bottom)
 - `distribute_shapes` - Distribute shapes evenly with equal spacing (horizontal, vertical)
 
-#### Component System (6 tools)
+#### Component System (8 tools)
 
 - `create_component` - Create reusable component from shape
 - `rename_component` - Rename component and update path metadata
@@ -85,6 +85,8 @@ The screenshot above demonstrates how you can describe a design in natural langu
 - `list_components` - List all components in file
 - `list_component_instances` - Enumerate component usage by page/shape
 - `instantiate_component` - Create component instance (supports linked libraries)
+- `query_components` - Filter registry by name/path patterns with usage metadata
+- `list_orphan_components` - Detect orphaned and low-use components for cleanup
 
 #### Team & Collaboration (10 tools)
 

@@ -2,7 +2,7 @@
  * Component Tools - Component operations
  */
 
-import { PenpotClient } from '../penpot-client.js';
+import { PenpotClient, postCommandGetLibraryFileReferences } from '../penpot-client.js';
 import { v4 as uuidv4 } from 'uuid';
 
 function getPagesIndex(data: any): Record<string, any> {
@@ -294,22 +294,150 @@ function listComponentInstancesFromData(args: {
   return instances;
 }
 
-function deriveRenamedComponentPath(existingPath: string | undefined, newName: string): string {
+function deriveRenamedComponentPath(
+  existingPath: string | undefined,
+  previousName: string | undefined,
+  newName: string
+): string {
   if (!existingPath || !existingPath.trim()) {
     return newName;
   }
 
-  const pathParts = existingPath
-    .split('/')
-    .map((part) => part.trim())
-    .filter((part) => part.length > 0);
+  const trimmedPreviousName = previousName?.trim();
+  if (!trimmedPreviousName) {
+    return existingPath;
+  }
 
-  if (pathParts.length === 0) {
+  if (existingPath === trimmedPreviousName) {
     return newName;
   }
 
-  pathParts[pathParts.length - 1] = newName;
-  return pathParts.join('/');
+  if (existingPath.endsWith(trimmedPreviousName)) {
+    return `${existingPath.slice(0, -trimmedPreviousName.length)}${newName}`;
+  }
+
+  return existingPath;
+}
+
+function readReferenceFileId(value: unknown): string | undefined {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  }
+  return undefined;
+}
+
+function extractReferenceFileId(reference: unknown): string | undefined {
+  if (typeof reference === 'string') {
+    return readReferenceFileId(reference);
+  }
+
+  if (!reference || typeof reference !== 'object') {
+    return undefined;
+  }
+
+  const ref = reference as Record<string, unknown>;
+  return (
+    readReferenceFileId(ref.fileId) ||
+    readReferenceFileId(ref['file-id']) ||
+    readReferenceFileId(ref.id) ||
+    readReferenceFileId(ref['id']) ||
+    readReferenceFileId(ref.file) ||
+    (typeof ref.file === 'object' &&
+      ref.file !== null &&
+      (readReferenceFileId((ref.file as Record<string, unknown>).id) ||
+        readReferenceFileId((ref.file as Record<string, unknown>).fileId) ||
+        readReferenceFileId((ref.file as Record<string, unknown>)['file-id']))) ||
+    undefined
+  );
+}
+
+function listReferencingFileIds(libraryReferences: unknown, sourceFileId: string): string[] {
+  if (!Array.isArray(libraryReferences)) {
+    return [];
+  }
+
+  const ids = new Set<string>();
+  for (const reference of libraryReferences) {
+    const fileId = extractReferenceFileId(reference);
+    if (fileId && fileId !== sourceFileId) {
+      ids.add(fileId);
+    }
+  }
+
+  return [...ids];
+}
+
+interface InstantiateComponentArgs {
+  fileId: string;
+  pageId: string;
+  componentId: string;
+  componentFile: string;
+  x?: number;
+  y?: number;
+  parentId?: string;
+  index?: number;
+  sessionId?: string;
+  skipValidate?: boolean;
+}
+
+interface InstantiateComponentSourceStatus {
+  isShellContainer: boolean;
+  rootType: string | null;
+}
+
+async function instantiateComponent(
+  penpotClient: PenpotClient,
+  args: InstantiateComponentArgs,
+  sourceStatusCache?: Map<string, InstantiateComponentSourceStatus>
+) {
+  const sourceCacheKey = `${args.componentFile}:${args.componentId}`;
+  let sourceStatus = sourceStatusCache?.get(sourceCacheKey);
+
+  if (!sourceStatus) {
+    const sourceCtx = await resolveComponentRootContext({
+      penpotClient,
+      fileId: args.componentFile,
+      componentId: args.componentId,
+    });
+
+    sourceStatus = {
+      isShellContainer: sourceCtx.integrity.isShellContainer,
+      rootType: typeof sourceCtx.rootShape?.type === 'string' ? sourceCtx.rootShape.type : null,
+    };
+
+    sourceStatusCache?.set(sourceCacheKey, sourceStatus);
+  }
+
+  if (sourceStatus.isShellContainer) {
+    throw new Error(
+      `Component ${args.componentId} is a shell ${sourceStatus.rootType || 'container'} with no nested children. Repair source structure before instantiating cross-file.`
+    );
+  }
+
+  const response = await penpotClient.client.post({
+    url: '/command/instantiate-component',
+    body: {
+      fileId: args.fileId,
+      pageId: args.pageId,
+      componentId: args.componentId,
+      componentFile: args.componentFile,
+      position: {
+        x: args.x ?? 0,
+        y: args.y ?? 0,
+      },
+      ...(args.parentId && { parentId: args.parentId }),
+      ...(args.index !== undefined && { index: args.index }),
+      ...(args.sessionId && { sessionId: args.sessionId }),
+      ...(args.skipValidate !== undefined && { skipValidate: args.skipValidate }),
+    } as any,
+  });
+
+  if (response.error) {
+    throw new Error(`Failed to instantiate component: ${JSON.stringify(response.error)}`);
+  }
+
+  return response.data;
 }
 
 function compileOptionalRegex(pattern: string | undefined, field: string): RegExp | undefined {
@@ -753,52 +881,8 @@ export function createComponentTools(penpotClient: PenpotClient) {
         },
         required: ['fileId', 'pageId', 'componentId', 'componentFile'],
       },
-      handler: async (args: {
-        fileId: string;
-        pageId: string;
-        componentId: string;
-        componentFile: string;
-        x?: number;
-        y?: number;
-        parentId?: string;
-        index?: number;
-        sessionId?: string;
-        skipValidate?: boolean;
-      }) => {
-        const sourceCtx = await resolveComponentRootContext({
-          penpotClient,
-          fileId: args.componentFile,
-          componentId: args.componentId,
-        });
-
-        if (sourceCtx.integrity.isShellContainer) {
-          throw new Error(
-            `Component ${args.componentId} is a shell ${sourceCtx.rootShape.type} with no nested children. Repair source structure before instantiating cross-file.`
-          );
-        }
-
-        const response = await penpotClient.client.post({
-          url: '/command/instantiate-component',
-          body: {
-            fileId: args.fileId,
-            pageId: args.pageId,
-            componentId: args.componentId,
-            componentFile: args.componentFile,
-            position: {
-              x: args.x ?? 0,
-              y: args.y ?? 0,
-            },
-            ...(args.parentId && { parentId: args.parentId }),
-            ...(args.index !== undefined && { index: args.index }),
-            ...(args.sessionId && { sessionId: args.sessionId }),
-            ...(args.skipValidate !== undefined && { skipValidate: args.skipValidate }),
-          } as any,
-        });
-
-        if (response.error) {
-          throw new Error(`Failed to instantiate component: ${JSON.stringify(response.error)}`);
-        }
-
+      handler: async (args: InstantiateComponentArgs) => {
+        const data = await instantiateComponent(penpotClient, args);
         return {
           content: [
             {
@@ -807,7 +891,146 @@ export function createComponentTools(penpotClient: PenpotClient) {
             },
             {
               type: 'text',
-              text: JSON.stringify(response.data, null, 2),
+              text: JSON.stringify(data, null, 2),
+            },
+          ],
+        };
+      },
+    },
+
+    batch_instantiate_component: {
+      description:
+        'Instantiate multiple components in one request with per-item success/failure reporting',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          items: {
+            type: 'array',
+            description: 'Array of component instantiation operations',
+            minItems: 1,
+            items: {
+              type: 'object',
+              properties: {
+                fileId: { type: 'string', description: 'Target file ID' },
+                pageId: { type: 'string', description: 'Target page ID' },
+                componentId: { type: 'string', description: 'Component ID to instantiate' },
+                componentFile: {
+                  type: 'string',
+                  description: 'File ID where the component is defined',
+                },
+                x: { type: 'number', description: 'X position', default: 0 },
+                y: { type: 'number', description: 'Y position', default: 0 },
+                parentId: {
+                  type: 'string',
+                  description: 'Optional parent shape ID where the instance should be inserted',
+                },
+                index: {
+                  type: 'number',
+                  description: 'Optional insertion index in the parent children list',
+                },
+                sessionId: {
+                  type: 'string',
+                  description: 'Optional session ID for server-side operation tracking',
+                },
+                skipValidate: {
+                  type: 'boolean',
+                  description: 'Skip server-side validation checks',
+                },
+              },
+              required: ['fileId', 'pageId', 'componentId', 'componentFile'],
+            },
+          },
+          continueOnError: {
+            type: 'boolean',
+            description: 'Continue processing after item failures (default true)',
+            default: true,
+          },
+        },
+        required: ['items'],
+      },
+      handler: async (args: { items: InstantiateComponentArgs[]; continueOnError?: boolean }) => {
+        if (!Array.isArray(args.items) || args.items.length === 0) {
+          throw new Error('items must be a non-empty array');
+        }
+
+        const continueOnError = args.continueOnError !== false;
+        const sourceStatusCache = new Map<string, InstantiateComponentSourceStatus>();
+        const results: Array<Record<string, any>> = [];
+        let successCount = 0;
+        let failureCount = 0;
+        let stopIndex = -1;
+
+        for (let index = 0; index < args.items.length; index += 1) {
+          const item = args.items[index];
+          try {
+            const data = await instantiateComponent(penpotClient, item, sourceStatusCache);
+            results.push({
+              index,
+              status: 'success',
+              fileId: item.fileId,
+              pageId: item.pageId,
+              componentId: item.componentId,
+              componentFile: item.componentFile,
+              data,
+            });
+            successCount += 1;
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            results.push({
+              index,
+              status: 'error',
+              fileId: item.fileId,
+              pageId: item.pageId,
+              componentId: item.componentId,
+              componentFile: item.componentFile,
+              error: message,
+            });
+            failureCount += 1;
+
+            if (!continueOnError) {
+              stopIndex = index;
+              break;
+            }
+          }
+        }
+
+        if (stopIndex >= 0) {
+          for (let index = stopIndex + 1; index < args.items.length; index += 1) {
+            const item = args.items[index];
+            results.push({
+              index,
+              status: 'skipped',
+              fileId: item.fileId,
+              pageId: item.pageId,
+              componentId: item.componentId,
+              componentFile: item.componentFile,
+              error: 'Skipped because continueOnError=false and a previous item failed',
+            });
+          }
+        }
+
+        const skippedCount = results.filter((result) => result.status === 'skipped').length;
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Batch instantiate completed: ${successCount} succeeded, ${failureCount} failed, ${skippedCount} skipped (${args.items.length} total)`,
+            },
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  total: args.items.length,
+                  successCount,
+                  failureCount,
+                  skippedCount,
+                  continueOnError,
+                  results,
+                },
+                null,
+                2
+              ),
             },
           ],
         };
@@ -935,7 +1158,9 @@ export function createComponentTools(penpotClient: PenpotClient) {
 
         const componentPath = (args.path ?? '').trim();
         const existingPath = typeof component.path === 'string' ? component.path : undefined;
-        const nextPath = componentPath || deriveRenamedComponentPath(existingPath, componentName);
+        const previousName = typeof component.name === 'string' ? component.name : undefined;
+        const nextPath =
+          componentPath || deriveRenamedComponentPath(existingPath, previousName, componentName);
 
         await penpotClient.applyChanges(args.fileId, [
           {
@@ -998,12 +1223,87 @@ export function createComponentTools(penpotClient: PenpotClient) {
           componentId: args.componentId,
           includeMainInstance: true,
         });
-        const referencingInstances = allInstances.filter((instance) => !instance.isMainInstance);
+        const inFileReferences = allInstances.filter((instance) => !instance.isMainInstance);
+
+        const libraryReferencesResult = await postCommandGetLibraryFileReferences({
+          client: penpotClient.client,
+          body: { fileId: args.fileId },
+        });
+
+        if (libraryReferencesResult.error) {
+          throw new Error(
+            `Failed to verify cross-file component references before deletion: ${JSON.stringify(libraryReferencesResult.error)}`
+          );
+        }
+
+        const referencingFileIds = listReferencingFileIds(
+          libraryReferencesResult.data,
+          args.fileId
+        );
+        const referenceInspectionResults = await Promise.all(
+          referencingFileIds.map(async (fileId) => {
+            try {
+              const consumerFile = await penpotClient.getFile(fileId);
+              const consumerData = consumerFile.data as any;
+              const instances = listComponentInstancesFromData({
+                fileId,
+                data: consumerData,
+                componentId: args.componentId,
+                componentFile: args.fileId,
+                includeMainInstance: true,
+              }).filter((instance) => !instance.isMainInstance);
+
+              return {
+                fileId,
+                instances,
+                error: null as string | null,
+              };
+            } catch (error) {
+              return {
+                fileId,
+                instances: [] as ComponentInstanceRecord[],
+                error: error instanceof Error ? error.message : String(error),
+              };
+            }
+          })
+        );
+
+        const failedReferenceInspections = referenceInspectionResults
+          .filter((result) => result.error)
+          .map((result) => ({
+            fileId: result.fileId,
+            error: result.error,
+          }));
+
+        if (failedReferenceInspections.length > 0) {
+          throw new Error(
+            `Cannot verify all cross-file references for component ${args.componentId}; refusing unsafe delete.\n${JSON.stringify(
+              failedReferenceInspections,
+              null,
+              2
+            )}`
+          );
+        }
+
+        const crossFileReferences = referenceInspectionResults.flatMap(
+          (result) => result.instances
+        );
+        const referencingInstances = [...inFileReferences, ...crossFileReferences];
 
         if (referencingInstances.length > 0) {
+          const referencingFileCount = new Set(
+            referencingInstances.map((instance) => instance.fileId)
+          ).size;
+
           throw new Error(
-            `Cannot delete component ${args.componentId}: ${referencingInstances.length} referencing instance(s) still exist. Use list_component_instances for full context.\n${JSON.stringify(
-              referencingInstances,
+            `Cannot delete component ${args.componentId}: ${referencingInstances.length} referencing instance(s) exist across ${referencingFileCount} file(s). Resolve references first.\n${JSON.stringify(
+              {
+                sourceFileId: args.fileId,
+                componentId: args.componentId,
+                inFileReferenceCount: inFileReferences.length,
+                crossFileReferenceCount: crossFileReferences.length,
+                references: referencingInstances,
+              },
               null,
               2
             )}`

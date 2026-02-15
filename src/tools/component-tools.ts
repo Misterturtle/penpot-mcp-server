@@ -2,7 +2,7 @@
  * Component Tools - Component operations
  */
 
-import { PenpotClient } from '../penpot-client.js';
+import { PenpotClient, postCommandGetLibraryFileReferences } from '../penpot-client.js';
 import { v4 as uuidv4 } from 'uuid';
 
 function getPagesIndex(data: any): Record<string, any> {
@@ -294,22 +294,78 @@ function listComponentInstancesFromData(args: {
   return instances;
 }
 
-function deriveRenamedComponentPath(existingPath: string | undefined, newName: string): string {
+function deriveRenamedComponentPath(
+  existingPath: string | undefined,
+  previousName: string | undefined,
+  newName: string
+): string {
   if (!existingPath || !existingPath.trim()) {
     return newName;
   }
 
-  const pathParts = existingPath
-    .split('/')
-    .map((part) => part.trim())
-    .filter((part) => part.length > 0);
+  const trimmedPreviousName = previousName?.trim();
+  if (!trimmedPreviousName) {
+    return existingPath;
+  }
 
-  if (pathParts.length === 0) {
+  if (existingPath === trimmedPreviousName) {
     return newName;
   }
 
-  pathParts[pathParts.length - 1] = newName;
-  return pathParts.join('/');
+  if (existingPath.endsWith(trimmedPreviousName)) {
+    return `${existingPath.slice(0, -trimmedPreviousName.length)}${newName}`;
+  }
+
+  return existingPath;
+}
+
+function readReferenceFileId(value: unknown): string | undefined {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  }
+  return undefined;
+}
+
+function extractReferenceFileId(reference: unknown): string | undefined {
+  if (typeof reference === 'string') {
+    return readReferenceFileId(reference);
+  }
+
+  if (!reference || typeof reference !== 'object') {
+    return undefined;
+  }
+
+  const ref = reference as Record<string, unknown>;
+  return (
+    readReferenceFileId(ref.fileId) ||
+    readReferenceFileId(ref['file-id']) ||
+    readReferenceFileId(ref.id) ||
+    readReferenceFileId(ref['id']) ||
+    readReferenceFileId(ref.file) ||
+    (typeof ref.file === 'object' &&
+      ref.file !== null &&
+      (readReferenceFileId((ref.file as Record<string, unknown>).id) ||
+        readReferenceFileId((ref.file as Record<string, unknown>).fileId) ||
+        readReferenceFileId((ref.file as Record<string, unknown>)['file-id']))) ||
+    undefined
+  );
+}
+
+function listReferencingFileIds(libraryReferences: unknown, sourceFileId: string): string[] {
+  if (!Array.isArray(libraryReferences)) {
+    return [];
+  }
+
+  const ids = new Set<string>();
+  for (const reference of libraryReferences) {
+    const fileId = extractReferenceFileId(reference);
+    if (fileId && fileId !== sourceFileId) {
+      ids.add(fileId);
+    }
+  }
+
+  return [...ids];
 }
 
 interface InstantiateComponentArgs {
@@ -1102,7 +1158,9 @@ export function createComponentTools(penpotClient: PenpotClient) {
 
         const componentPath = (args.path ?? '').trim();
         const existingPath = typeof component.path === 'string' ? component.path : undefined;
-        const nextPath = componentPath || deriveRenamedComponentPath(existingPath, componentName);
+        const previousName = typeof component.name === 'string' ? component.name : undefined;
+        const nextPath =
+          componentPath || deriveRenamedComponentPath(existingPath, previousName, componentName);
 
         await penpotClient.applyChanges(args.fileId, [
           {
@@ -1165,12 +1223,87 @@ export function createComponentTools(penpotClient: PenpotClient) {
           componentId: args.componentId,
           includeMainInstance: true,
         });
-        const referencingInstances = allInstances.filter((instance) => !instance.isMainInstance);
+        const inFileReferences = allInstances.filter((instance) => !instance.isMainInstance);
+
+        const libraryReferencesResult = await postCommandGetLibraryFileReferences({
+          client: penpotClient.client,
+          body: { fileId: args.fileId },
+        });
+
+        if (libraryReferencesResult.error) {
+          throw new Error(
+            `Failed to verify cross-file component references before deletion: ${JSON.stringify(libraryReferencesResult.error)}`
+          );
+        }
+
+        const referencingFileIds = listReferencingFileIds(
+          libraryReferencesResult.data,
+          args.fileId
+        );
+        const referenceInspectionResults = await Promise.all(
+          referencingFileIds.map(async (fileId) => {
+            try {
+              const consumerFile = await penpotClient.getFile(fileId);
+              const consumerData = consumerFile.data as any;
+              const instances = listComponentInstancesFromData({
+                fileId,
+                data: consumerData,
+                componentId: args.componentId,
+                componentFile: args.fileId,
+                includeMainInstance: true,
+              }).filter((instance) => !instance.isMainInstance);
+
+              return {
+                fileId,
+                instances,
+                error: null as string | null,
+              };
+            } catch (error) {
+              return {
+                fileId,
+                instances: [] as ComponentInstanceRecord[],
+                error: error instanceof Error ? error.message : String(error),
+              };
+            }
+          })
+        );
+
+        const failedReferenceInspections = referenceInspectionResults
+          .filter((result) => result.error)
+          .map((result) => ({
+            fileId: result.fileId,
+            error: result.error,
+          }));
+
+        if (failedReferenceInspections.length > 0) {
+          throw new Error(
+            `Cannot verify all cross-file references for component ${args.componentId}; refusing unsafe delete.\n${JSON.stringify(
+              failedReferenceInspections,
+              null,
+              2
+            )}`
+          );
+        }
+
+        const crossFileReferences = referenceInspectionResults.flatMap(
+          (result) => result.instances
+        );
+        const referencingInstances = [...inFileReferences, ...crossFileReferences];
 
         if (referencingInstances.length > 0) {
+          const referencingFileCount = new Set(
+            referencingInstances.map((instance) => instance.fileId)
+          ).size;
+
           throw new Error(
-            `Cannot delete component ${args.componentId}: ${referencingInstances.length} referencing instance(s) still exist. Use list_component_instances for full context.\n${JSON.stringify(
-              referencingInstances,
+            `Cannot delete component ${args.componentId}: ${referencingInstances.length} referencing instance(s) exist across ${referencingFileCount} file(s). Resolve references first.\n${JSON.stringify(
+              {
+                sourceFileId: args.fileId,
+                componentId: args.componentId,
+                inFileReferenceCount: inFileReferences.length,
+                crossFileReferenceCount: crossFileReferences.length,
+                references: referencingInstances,
+              },
               null,
               2
             )}`
